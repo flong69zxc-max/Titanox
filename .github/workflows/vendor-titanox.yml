@@ -1,0 +1,62 @@
+name: Vendor Titanox
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - .github/workflows/vendor-titanox.yml
+
+permissions:
+  contents: write
+
+jobs:
+  vendor:
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Clone upstream Titanox
+        run: |
+          set -euo pipefail
+          rm -rf /tmp/titanox_upstream
+          git clone --depth 1 https://github.com/Ragekill3377/Titanox.git /tmp/titanox_upstream
+          rm -rf /tmp/titanox_upstream/.git
+
+      - name: Copy into repo
+        run: |
+          set -euo pipefail
+          cp -an /tmp/titanox_upstream/. .
+
+      - name: Patch duplicate segment name
+        run: |
+          set -euo pipefail
+          FOUND=0
+          for f in $(grep -rl 'HOOK_DATA_SEGMENT[[:space:]]*=[[:space:]]*"__TITANOX_HOOK"' . 2>/dev/null || true); do
+            echo "patching $f"
+            sed -i.bak 's/HOOK_DATA_SEGMENT[[:space:]]*=[[:space:]]*"__TITANOX_HOOK"/HOOK_DATA_SEGMENT = "__TITANOX_DATA"/g' "$f"
+            rm -f "$f.bak"
+            FOUND=1
+          done
+          if [ "$FOUND" = "0" ]; then
+            echo "warning: no target strings found"
+          fi
+          echo "--- result ---"
+          grep -rn 'HOOK_TEXT_SEGMENT\|HOOK_DATA_SEGMENT' . | head -20 || true
+
+      - name: Commit and push
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add -A
+          if git diff --staged --quiet; then
+            echo "no changes to commit"
+          else
+            git commit -m "Vendor Titanox upstream + fix duplicate segment name"
+            git push
+          fi
