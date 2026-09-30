@@ -52,11 +52,8 @@ kern_return_t catch_mach_exception_raise_state(
 
     uintptr_t pc = arm_thread_state64_get_pc(*old);
 
-    OXLogC("EXC_HIT", (uint64_t)pc, (uint64_t)exception);
-
     for (int i = 0; i < active_hooks; ++i) {
         if (hooks[i].old == pc) {
-            OXLogC("EXC_MATCH", (uint64_t)pc, (uint64_t)hooks[i].new);
             if (g_in_hook) {
                 *new = *old;
                 *new_stateCnt = old_stateCnt;
@@ -112,7 +109,6 @@ bool hook(void *old[], void *new[], int count) {
         size_t size = sizeof(breakpoints);
         sysctlbyname("hw.optional.breakpoint", &breakpoints, &size, NULL, 0);
         if (breakpoints <= 0) breakpoints = 6;
-        OXLogC("SYSCTL_BP", (uint64_t)breakpoints, 0);
 
         mach_port_t current_ports[EXC_TYPES_COUNT];
         mach_msg_type_number_t port_count = EXC_TYPES_COUNT;
@@ -123,30 +119,22 @@ bool hook(void *old[], void *new[], int count) {
         if (task_get_exception_ports(mach_task_self(), EXC_MASK_BREAKPOINT,
                                      masks, &port_count, current_ports,
                                      behaviors, flavors) == KERN_SUCCESS) {
-            OXLogC("EXC_PORTS", (uint64_t)port_count, 0);
             if (port_count > 0) orig_handler_port = current_ports[0];
         }
 
-        kern_return_t kr1 = mach_port_allocate(mach_task_self(),
-                                                MACH_PORT_RIGHT_RECEIVE, &server);
-        OXLogC("PORT_ALLOC", (uint64_t)kr1, (uint64_t)server);
+        mach_port_allocate(mach_task_self(), MACH_PORT_RIGHT_RECEIVE, &server);
         mach_port_insert_right(mach_task_self(), server, server,
                                MACH_MSG_TYPE_MAKE_SEND);
-        kern_return_t kr3 = task_set_exception_ports(mach_task_self(),
-                                EXC_MASK_BREAKPOINT, server,
-                                EXCEPTION_STATE | MACH_EXCEPTION_CODES,
-                                ARM_THREAD_STATE64);
-        OXLogC("SET_EXC_PORT", (uint64_t)kr3, 0);
+        task_set_exception_ports(mach_task_self(), EXC_MASK_BREAKPOINT, server,
+                                 EXCEPTION_STATE | MACH_EXCEPTION_CODES,
+                                 ARM_THREAD_STATE64);
 
         pthread_t thread;
         pthread_create(&thread, NULL, exception_handler, NULL);
         initialized = true;
     }
 
-    if (g_debug_slots + count > breakpoints) {
-        OXLogC("NO_SLOTS", (uint64_t)g_debug_slots, (uint64_t)count);
-        return false;
-    }
+    if (g_debug_slots + count > breakpoints) return false;
 
     for (int i = 0; i < count; i++) {
         int slot = g_debug_slots;
@@ -158,15 +146,11 @@ bool hook(void *old[], void *new[], int count) {
         active_hooks++;
     }
 
-    kern_return_t kr4 = task_set_state(mach_task_self(), ARM_DEBUG_STATE64,
-                                       (thread_state_t)&g_debug_state,
-                                       ARM_DEBUG_STATE64_COUNT);
-    OXLogC("TASK_SET_STATE", (uint64_t)kr4, (uint64_t)g_debug_slots);
-    if (kr4 != KERN_SUCCESS) return false;
+    if (task_set_state(mach_task_self(), ARM_DEBUG_STATE64,
+                       (thread_state_t)&g_debug_state,
+                       ARM_DEBUG_STATE64_COUNT) != KERN_SUCCESS) return false;
 
     apply_debug_state_to_all_threads();
-    OXLogC("APPLIED_SLOTS", (uint64_t)g_debug_slots, 0);
-
     return true;
 }
 
