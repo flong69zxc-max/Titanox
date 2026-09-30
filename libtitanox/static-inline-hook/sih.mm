@@ -11,6 +11,16 @@
 
 using namespace SIH;
 
+static vm_size_t get_page_size() {
+    vm_size_t ps = vm_page_size;
+    if (ps == 0) ps = 0x4000;
+    return ps;
+}
+
+static uint64_t align_up(uint64_t v, uint64_t a) {
+    return (v + a - 1) & ~(a - 1);
+}
+
 MachOHooker::MachOHooker(const std::string& macho_name) : macho_name_(macho_name) {
     if (macho_name_.empty()) {
         LOG(@"can't init, no name...");
@@ -60,7 +70,6 @@ bool MachOHooker::load_macho_data() {
     THLog(@"loaded binary");
     return validate_macho();
 }
-
 
 bool MachOHooker::validate_macho() {
     if (macho_data_.length < sizeof(mach_header_64)) {
@@ -170,17 +179,29 @@ bool MachOHooker::add_hook_sections() {
         return false;
     }
 
+    vm_size_t page_size = get_page_size();
+
+    uint64_t aligned_vm_end = align_up(info.vm_end, page_size);
+    uint64_t aligned_fileoff = align_up(macho_data_.length, page_size);
+
     NSRange linkedit_range = NSMakeRange(info.linkedit_seg->fileoff, info.linkedit_seg->filesize);
     NSData* linkedit_data = [macho_data_ subdataWithRange:linkedit_range];
     [macho_data_ replaceBytesInRange:linkedit_range withBytes:nil length:0];
 
+    if (macho_data_.length < aligned_fileoff) {
+        NSUInteger padding = aligned_fileoff - macho_data_.length;
+        uint8_t *zeros = (uint8_t *)calloc(1, padding);
+        [macho_data_ appendBytes:zeros length:padding];
+        free(zeros);
+    }
+
     segment_command_64 text_seg = {
         .cmd = LC_SEGMENT_64,
         .cmdsize = sizeof(segment_command_64) + sizeof(section_64),
-        .vmaddr = info.vm_end,
-        .vmsize = CODE_PAGE_SIZE,
+        .vmaddr = aligned_vm_end,
+        .vmsize = page_size,
         .fileoff = (uint32_t)macho_data_.length,
-        .filesize = CODE_PAGE_SIZE,
+        .filesize = page_size,
         .maxprot = VM_PROT_READ | VM_PROT_EXECUTE,
         .initprot = VM_PROT_READ | VM_PROT_EXECUTE,
         .nsects = 1
@@ -196,13 +217,16 @@ bool MachOHooker::add_hook_sections() {
     strncpy(text_sec.segname, HOOK_TEXT_SEGMENT, sizeof(text_sec.segname));
     strncpy(text_sec.sectname, HOOK_TEXT_SECTION, sizeof(text_sec.sectname));
 
+    uint64_t data_vmaddr = aligned_vm_end + page_size;
+    uint64_t data_fileoff = text_seg.fileoff + text_seg.filesize;
+
     segment_command_64 data_seg = {
         .cmd = LC_SEGMENT_64,
         .cmdsize = sizeof(segment_command_64) + sizeof(section_64),
-        .vmaddr = text_seg.vmaddr + text_seg.vmsize,
-        .vmsize = DATA_PAGE_SIZE,
-        .fileoff = text_seg.fileoff + text_seg.filesize,
-        .filesize = DATA_PAGE_SIZE,
+        .vmaddr = data_vmaddr,
+        .vmsize = page_size,
+        .fileoff = data_fileoff,
+        .filesize = page_size,
         .maxprot = VM_PROT_READ | VM_PROT_WRITE,
         .initprot = VM_PROT_READ | VM_PROT_WRITE,
         .nsects = 1
@@ -232,8 +256,8 @@ bool MachOHooker::add_hook_sections() {
     memcpy(patch, cmds.get() + ((uint8_t*)info.linkedit_seg - ((uint8_t*)header_ + sizeof(*header_))), header_->sizeofcmds - ((uint8_t*)info.linkedit_seg - ((uint8_t*)header_ + sizeof(*header_))));
 
     info.linkedit_seg = (segment_command_64*)patch;
-    info.linkedit_seg->fileoff = macho_data_.length + text_seg.filesize + data_seg.filesize;
-    info.linkedit_seg->vmaddr = info.vm_end + text_seg.vmsize + data_seg.vmsize;
+    info.linkedit_seg->fileoff = data_fileoff + data_seg.filesize;
+    info.linkedit_seg->vmaddr = data_vmaddr + data_seg.vmsize;
 
     header_->ncmds += 2;
     header_->sizeofcmds += text_seg.cmdsize + data_seg.cmdsize;
@@ -242,13 +266,13 @@ bool MachOHooker::add_hook_sections() {
         return false;
     }
 
-    auto code_page = std::make_unique<uint8_t[]>(CODE_PAGE_SIZE);
-    std::fill_n(code_page.get(), CODE_PAGE_SIZE, 0xFF);
-    [macho_data_ appendBytes:code_page.get() length:CODE_PAGE_SIZE];
+    auto code_page = std::make_unique<uint8_t[]>(page_size);
+    std::fill_n(code_page.get(), page_size, 0xFF);
+    [macho_data_ appendBytes:code_page.get() length:page_size];
 
-    auto data_page = std::make_unique<uint8_t[]>(DATA_PAGE_SIZE);
-    std::fill_n(data_page.get(), DATA_PAGE_SIZE, 0);
-    [macho_data_ appendBytes:data_page.get() length:DATA_PAGE_SIZE];
+    auto data_page = std::make_unique<uint8_t[]>(page_size);
+    std::fill_n(data_page.get(), page_size, 0);
+    [macho_data_ appendBytes:data_page.get() length:page_size];
 
     [macho_data_ appendData:linkedit_data];
 
@@ -339,7 +363,6 @@ uint64_t MachOHooker::va_to_rva(uint64_t va) const {
 }
 
 void* MachOHooker::rva_to_data(uint64_t rva) const {
-    // resolve the on-disk __TEXT base vmaddr so we can convert RVA -> VA
     uint64_t header_vaddr = 0;
     auto* lc = (load_command*)((uint64_t)header_ + sizeof(*header_));
 
@@ -357,7 +380,6 @@ void* MachOHooker::rva_to_data(uint64_t rva) const {
         lc = (load_command*)((uint64_t)lc + lc->cmdsize);
     }
 
-    // convert RVA back to VA for segment range lookup
     uint64_t va = rva + header_vaddr;
     lc = (load_command*)((uint64_t)header_ + sizeof(*header_));
 
@@ -398,7 +420,6 @@ HookBlock* MachOHooker::find_hook_block(void* base, uint64_t vaddr) const {
     segment_command_64* text_seg = nullptr;
     segment_command_64* data_seg = nullptr;
 
-    // find the on-disk __TEXT base vmaddr so we can compute the runtime slide
     uint64_t text_base_vaddr = 0;
     for (uint32_t i = 0; i < header->ncmds; ++i) {
         if (lc->cmd == LC_SEGMENT_64) {
@@ -417,10 +438,9 @@ HookBlock* MachOHooker::find_hook_block(void* base, uint64_t vaddr) const {
         return nullptr;
     }
 
-    // slide = runtime load address of __TEXT minus its on-disk vmaddr
     intptr_t slide = (intptr_t)base - (intptr_t)text_base_vaddr;
     auto* hook_block = (HookBlock*)(data_seg->vmaddr + slide);
-    for (size_t i = 0; i < DATA_PAGE_SIZE / sizeof(HookBlock); ++i) {
+    for (size_t i = 0; i < get_page_size() / sizeof(HookBlock); ++i) {
         if (hook_block[i].hook_vaddr == vaddr) {
             return &hook_block[i];
         }
@@ -457,24 +477,6 @@ uint64_t MachOHooker::calculate_patch_hash(uint64_t vaddr, const std::string& pa
     return std::hash<std::string>{}(patch) ^ vaddr;
 }
 
-
-/*
-
-Just doing 'B' is bad. this is better. still can be made better.
-    LDR X16, #8        ; load 64-bit target from PC+8 (i.e. the .quad below)
-    BR  X16            ; branch to it
-    .quad <addr>  ; 64-bit absolute address
-
-LDR (literal) encoding:
-  bits[31:30] = 01  (64-bit variant)
-  bits[29:27] = 011 (LDR literal)
-  bits[26]    = 0
-  imm19 encodes the PC-relative word offset to the data (.quad is 2 words ahead = imm19=2)
-  => 0x58000050
-
-BR X16 encoding: 0xD61F0200
-
-*/
 bool MachOHooker::apply_inline_patch(HookBlock* block, uint64_t func_rva, void* func_data, uint64_t target_rva, void* target_data, const std::string& patch_bytes)
 {
     if (!block || !func_data || !target_data) {
@@ -482,24 +484,23 @@ bool MachOHooker::apply_inline_patch(HookBlock* block, uint64_t func_rva, void* 
         return false;
     }
 
-    const uint64_t stub_size = 12; // 3 instructions / 2 instrs + 8-byte literal
-    uint64_t tramp_va = 0; // patched to runtime address in hook_function
+    const uint64_t stub_size = 12;
+    uint64_t tramp_va = 0;
 
-    const uint64_t displaced_size = stub_size; // same 12 bytes
-    memcpy(target_data, func_data, displaced_size); // save original bytes before overwriting
+    const uint64_t displaced_size = stub_size;
+    memcpy(target_data, func_data, displaced_size);
     struct { uint32_t ldr; uint32_t br; uint64_t addr; } stub = { 0x58000050, 0xD61F0200, tramp_va };
     memcpy(func_data, &stub, stub_size);
 
-    // return stub at trampoline+12: jumps back past the hook
     uint64_t return_target_rva = func_rva + stub_size;
     struct { uint32_t ldr; uint32_t br; uint64_t addr; } ret_stub = {
-        0x58000050, // LDR X16, #8
-        0xD61F0200, // BR X16
-        return_target_rva //
+        0x58000050,
+        0xD61F0200,
+        return_target_rva
     };
 
     memcpy((uint8_t*)target_data + displaced_size, &ret_stub, sizeof(ret_stub));
-    const uint64_t trampoline_total = displaced_size + sizeof(ret_stub); // 24 bytes
+    const uint64_t trampoline_total = displaced_size + sizeof(ret_stub);
 
     block->hook_vaddr    = func_rva;
     block->original_vaddr = func_rva + stub_size;
@@ -519,7 +520,6 @@ bool MachOHooker::apply_inline_patch(HookBlock* block, uint64_t func_rva, void* 
 
     return true;
 }
-
 
 std::optional<std::string> MachOHooker::apply_patch(uint64_t vaddr, const std::string& patch_bytes) {
     if (vaddr % 4 != 0) {
@@ -555,7 +555,7 @@ std::optional<std::string> MachOHooker::apply_patch(uint64_t vaddr, const std::s
     auto* hook_block = (HookBlock*)rva_to_data(va_to_rva(data_segment_->vmaddr));
     HookBlock* free_block = nullptr;
 
-    for (size_t i = 0; i < DATA_PAGE_SIZE / sizeof(HookBlock); ++i) {
+    for (size_t i = 0; i < get_page_size() / sizeof(HookBlock); ++i) {
         if (hook_block[i].hook_vaddr == func_rva) {
             if (!patch_bytes.empty() && hook_block[i].patch_hash != calculate_patch_hash(vaddr, patch_bytes)) {
                 return "Patch bytes have changed";
