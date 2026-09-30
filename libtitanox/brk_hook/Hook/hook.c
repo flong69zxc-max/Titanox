@@ -6,6 +6,7 @@
 #include <mach-o/nlist.h>
 #include <mach/mach.h>
 #include <pthread.h>
+#include <unistd.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <sys/sysctl.h>
@@ -42,6 +43,7 @@ static arm_debug_state64_t g_debug_state = {};
 static int g_debug_slots = 0;
 static volatile int g_exc_count = 0;
 static volatile int g_apply_count = 0;
+static volatile int g_stop_timer = 0;
 
 kern_return_t catch_mach_exception_raise_state(
     mach_port_t exception_port, exception_type_t exception,
@@ -56,6 +58,13 @@ kern_return_t catch_mach_exception_raise_state(
     uintptr_t pc_raw = (uintptr_t)arm_thread_state64_get_pc(*old);
     uintptr_t pc_fptr = (uintptr_t)arm_thread_state64_get_pc_fptr(*old);
     g_exc_count++;
+
+    if (g_in_hook) {
+        *new = *old;
+        *new_stateCnt = old_stateCnt;
+        arm_thread_state64_set_pc_fptr(*new, (void *)(uintptr_t)(pc_raw + 4));
+        return KERN_SUCCESS;
+    }
 
     OXLogC("EXC_RAW", (uint64_t)pc_raw, (uint64_t)g_exc_count);
     OXLogC("EXC_FPTR", (uint64_t)pc_fptr, (uint64_t)exception);
@@ -73,12 +82,6 @@ kern_return_t catch_mach_exception_raise_state(
         uintptr_t target = hooks[i].old;
         if (target == pc_raw || target == pc_fptr) {
             OXLogC("EXC_DISPATCH", (uint64_t)target, (uint64_t)hooks[i].new);
-            if (g_in_hook) {
-                *new = *old;
-                *new_stateCnt = old_stateCnt;
-                arm_thread_state64_set_pc_fptr(*new, (void *)(uintptr_t)(pc_raw + 4));
-                return KERN_SUCCESS;
-            }
             *new = *old;
             *new_stateCnt = old_stateCnt;
             arm_thread_state64_set_pc_fptr(*new, (void *)(uintptr_t)hooks[i].new);
@@ -151,19 +154,20 @@ static void apply_debug_state_to_all_threads(const char *why) {
     }
 }
 
-static void start_reapply_timer(void) {
-    static dispatch_source_t timer = NULL;
-    if (timer) return;
-    dispatch_queue_t q = dispatch_queue_create("titanox.brk.timer", NULL);
-    timer = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0, q);
-    dispatch_source_set_timer(timer,
-                              dispatch_time(DISPATCH_TIME_NOW, 500 * NSEC_PER_MSEC),
-                              500 * NSEC_PER_MSEC,
-                              100 * NSEC_PER_MSEC);
-    dispatch_source_set_event_handler(timer, ^{
+static void *reapply_timer_thread(void *arg) {
+    while (!g_stop_timer) {
+        usleep(500 * 1000);
         apply_debug_state_to_all_threads("APPLY_TIMER");
-    });
-    dispatch_resume(timer);
+    }
+    return NULL;
+}
+
+static void start_reapply_timer(void) {
+    static pthread_t t;
+    static int started = 0;
+    if (started) return;
+    pthread_create(&t, NULL, reapply_timer_thread, NULL);
+    started = 1;
     OXLogC("TIMER_STARTED", 0, 0);
 }
 
