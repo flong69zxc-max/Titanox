@@ -5,11 +5,9 @@ permissions:
   contents: write
 jobs:
   vendor:
-    runs-on: ubuntu-24.04-arm
-    timeout-minutes: 30
+    runs-on: ubuntu-latest
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
         with:
           fetch-depth: 0
           token: ${{ secrets.GITHUB_TOKEN }}
@@ -35,8 +33,8 @@ jobs:
 
       - name: Commit
         run: |
-          git config user.name "bot"
-          git config user.email "bot@users.noreply.github.com"
+          git config user.name bot
+          git config user.email bot@users.noreply.github.com
           git add -A
           git diff --staged --quiet || git commit -m "vendor titanox"
           git push
