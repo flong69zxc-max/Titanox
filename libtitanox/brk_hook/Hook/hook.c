@@ -10,57 +10,50 @@
 #include <sys/stat.h>
 #include <sys/sysctl.h>
 
+__thread int g_in_hook = 0;
+
 kern_return_t catch_mach_exception_raise(
-    mach_port_t exception_port,
-    mach_port_t thread,
-    mach_port_t task,
-    exception_type_t exception,
-    mach_exception_data_t code,
+    mach_port_t exception_port, mach_port_t thread, mach_port_t task,
+    exception_type_t exception, mach_exception_data_t code,
     mach_msg_type_number_t codeCnt) {
     abort();
 }
 
 kern_return_t catch_mach_exception_raise_state_identity(
-    mach_port_t exception_port,
-    mach_port_t thread,
-    mach_port_t task,
-    exception_type_t exception,
-    mach_exception_data_t code,
-    mach_msg_type_number_t codeCnt,
-    int *flavor,
-    thread_state_t old_state,
-    mach_msg_type_number_t old_stateCnt,
-    thread_state_t new_state,
-    mach_msg_type_number_t *new_stateCnt) {
+    mach_port_t exception_port, mach_port_t thread, mach_port_t task,
+    exception_type_t exception, mach_exception_data_t code,
+    mach_msg_type_number_t codeCnt, int *flavor,
+    thread_state_t old_state, mach_msg_type_number_t old_stateCnt,
+    thread_state_t new_state, mach_msg_type_number_t *new_stateCnt) {
     abort();
 }
 
 mach_port_t server;
 static mach_port_t orig_handler_port = MACH_PORT_NULL;
 
-struct hook {
-    uintptr_t old;
-    uintptr_t new;
-};
+struct hook { uintptr_t old; uintptr_t new; };
 static struct hook hooks[16];
-static int active_hooks;
+static int active_hooks = 0;
 
 kern_return_t catch_mach_exception_raise_state(
-    mach_port_t exception_port,
-    exception_type_t exception,
-    const mach_exception_data_t code,
-    mach_msg_type_number_t codeCnt,
-    int *flavor,
-    const thread_state_t old_state,
-    mach_msg_type_number_t old_stateCnt,
-    thread_state_t new_state,
+    mach_port_t exception_port, exception_type_t exception,
+    const mach_exception_data_t code, mach_msg_type_number_t codeCnt,
+    int *flavor, const thread_state_t old_state,
+    mach_msg_type_number_t old_stateCnt, thread_state_t new_state,
     mach_msg_type_number_t *new_stateCnt) {
 
     arm_thread_state64_t *old = (arm_thread_state64_t *)old_state;
     arm_thread_state64_t *new = (arm_thread_state64_t *)new_state;
 
+    uintptr_t pc = arm_thread_state64_get_pc(*old);
+
     for (int i = 0; i < active_hooks; ++i) {
-        if (hooks[i].old == arm_thread_state64_get_pc(*old)) {
+        if (hooks[i].old == pc) {
+            if (g_in_hook) {
+                *new = *old;
+                *new_stateCnt = old_stateCnt;
+                return KERN_SUCCESS;
+            }
             *new = *old;
             *new_stateCnt = old_stateCnt;
             arm_thread_state64_set_pc_fptr(*new, (void *)(uintptr_t)hooks[i].new);
@@ -71,10 +64,8 @@ kern_return_t catch_mach_exception_raise_state(
     if (orig_handler_port != MACH_PORT_NULL) {
         return mach_msg_server(mach_exc_server,
                                sizeof(union __RequestUnion__catch_mach_exc_subsystem),
-                               orig_handler_port,
-                               MACH_MSG_OPTION_NONE);
+                               orig_handler_port, MACH_MSG_OPTION_NONE);
     }
-
     return KERN_FAILURE;
 }
 
@@ -82,8 +73,7 @@ void *exception_handler(void *unused) {
     while (1) {
         mach_msg_server(mach_exc_server,
                         sizeof(union __RequestUnion__catch_mach_exc_subsystem),
-                        server,
-                        MACH_MSG_OPTION_NONE);
+                        server, MACH_MSG_OPTION_NONE);
     }
     return NULL;
 }
@@ -91,7 +81,7 @@ void *exception_handler(void *unused) {
 bool hook(void *old[], void *new[], int count) {
     if (count > 6) return false;
 
-    static bool initialized;
+    static bool initialized = false;
     static bool thread_initialized = false;
     static int breakpoints = 0;
 
@@ -123,7 +113,6 @@ bool hook(void *old[], void *new[], int count) {
             pthread_create(&thread, NULL, exception_handler, NULL);
             thread_initialized = true;
         }
-
         initialized = true;
     }
 
