@@ -241,7 +241,7 @@ bool hook(void *old[], void *new[], int count) {
         uintptr_t dest = (uintptr_t)new[i];
 
         g_debug_state.__bvr[slot] = target;
-        g_debug_state.__bcr[slot] = 0x1e7;
+        g_debug_state.__bcr[slot] = 0x1e5;
 
         hooks[active_hooks].old = target;
         hooks[active_hooks].new = dest;
@@ -279,7 +279,7 @@ bool unhook(void *old[], int count) {
     g_debug_slots = 0;
     for (int i = 0; i < active_hooks && i < 16; i++) {
         g_debug_state.__bvr[i] = hooks[i].old;
-        g_debug_state.__bcr[i] = 0x1e7;
+        g_debug_state.__bcr[i] = 0x1e5;
         g_debug_slots++;
     }
     task_set_state(mach_task_self(), ARM_DEBUG_STATE64,
