@@ -176,7 +176,7 @@ static void verify_brk_instruction(uintptr_t addr) {
     kern_return_t kr = vm_read_overwrite(mach_task_self(),
                                          (vm_address_t)addr, 4,
                                          (vm_address_t)&w, &outSize);
-    OXLogC("VERIFY_BRK", (uint64_t)addr, (uint64_t)w);
+    OXLogC("VERIFY_BRK", (uint64_t)kr, (uint64_t)w);
 }
 
 bool hook(void *old[], void *new[], int count) {
