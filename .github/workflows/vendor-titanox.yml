@@ -19,11 +19,12 @@ jobs:
           rm -rf /tmp/up
           git clone --depth 1 https://github.com/Ragekill3377/Titanox.git /tmp/up
           rm -rf /tmp/up/.git
+          rm -rf /tmp/up/.github
 
       - name: Copy
         run: cp -an /tmp/up/. .
 
-      - name: Patch segment name
+      - name: Patch segment
         run: |
           grep -rl 'HOOK_DATA_SEGMENT.*"__TITANOX_HOOK"' . 2>/dev/null | while read f; do
             echo "patch $f"
