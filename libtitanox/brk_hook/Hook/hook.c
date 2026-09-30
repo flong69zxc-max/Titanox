@@ -13,7 +13,6 @@
 __thread int g_in_hook = 0;
 
 extern void OXLogC(const char *tag, uint64_t a, uint64_t b);
-extern void OXLogS(const char *tag, const char *msg);
 
 kern_return_t catch_mach_exception_raise(
     mach_port_t exception_port, mach_port_t thread, mach_port_t task,
@@ -43,7 +42,6 @@ static arm_debug_state64_t g_debug_state = {};
 static int g_debug_slots = 0;
 static volatile int g_exc_count = 0;
 static volatile int g_apply_count = 0;
-static volatile int g_init_done = 0;
 
 kern_return_t catch_mach_exception_raise_state(
     mach_port_t exception_port, exception_type_t exception,
@@ -61,7 +59,6 @@ kern_return_t catch_mach_exception_raise_state(
 
     OXLogC("EXC_RAW", (uint64_t)pc_raw, (uint64_t)g_exc_count);
     OXLogC("EXC_FPTR", (uint64_t)pc_fptr, (uint64_t)exception);
-    OXLogC("EXC_STATE_SZ", (uint64_t)old_stateCnt, (uint64_t)*flavor);
 
     for (int i = 0; i < active_hooks; ++i) {
         if (hooks[i].old == pc_raw) {
@@ -98,7 +95,7 @@ kern_return_t catch_mach_exception_raise_state(
 }
 
 void *exception_handler(void *unused) {
-    OXLogS("EXC_THREAD", "started");
+    OXLogC("EXC_THREAD_STARTED", 0, 0);
     while (1) {
         mach_msg_server(mach_exc_server,
                         sizeof(union __RequestUnion__catch_mach_exc_subsystem),
@@ -167,7 +164,7 @@ static void start_reapply_timer(void) {
         apply_debug_state_to_all_threads("APPLY_TIMER");
     });
     dispatch_resume(timer);
-    OXLogS("TIMER", "started");
+    OXLogC("TIMER_STARTED", 0, 0);
 }
 
 static void verify_brk_instruction(uintptr_t addr) {
@@ -225,9 +222,8 @@ bool hook(void *old[], void *new[], int count) {
         OXLogC("PTHREAD_CREATE", (uint64_t)pr, (uint64_t)thread);
 
         start_reapply_timer();
-        g_init_done = 1;
         initialized = true;
-        OXLogS("HOOK_INIT", "done");
+        OXLogC("HOOK_INIT_DONE", 0, 0);
     }
 
     if (g_debug_slots + count > breakpoints) {
