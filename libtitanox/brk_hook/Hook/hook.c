@@ -12,8 +12,6 @@
 
 __thread int g_in_hook = 0;
 
-extern void OXLogC(const char *tag, uint64_t a, uint64_t b);
-
 kern_return_t catch_mach_exception_raise(
     mach_port_t exception_port, mach_port_t thread, mach_port_t task,
     exception_type_t exception, mach_exception_data_t code,
