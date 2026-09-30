@@ -1,62 +1,41 @@
 name: Vendor Titanox
-
 on:
   workflow_dispatch:
-  push:
-    branches: [main]
-    paths:
-      - .github/workflows/vendor-titanox.yml
-
 permissions:
   contents: write
-
 jobs:
   vendor:
     runs-on: ubuntu-24.04-arm
     timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout
+        uses: actions/checkout@v4
         with:
           fetch-depth: 0
           token: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Clone upstream Titanox
+      - name: Clone upstream
         run: |
-          set -euo pipefail
-          rm -rf /tmp/titanox_upstream
-          git clone --depth 1 https://github.com/Ragekill3377/Titanox.git /tmp/titanox_upstream
-          rm -rf /tmp/titanox_upstream/.git
+          rm -rf /tmp/up
+          git clone --depth 1 https://github.com/Ragekill3377/Titanox.git /tmp/up
+          rm -rf /tmp/up/.git
 
-      - name: Copy into repo
-        run: |
-          set -euo pipefail
-          cp -an /tmp/titanox_upstream/. .
+      - name: Copy
+        run: cp -an /tmp/up/. .
 
-      - name: Patch duplicate segment name
+      - name: Patch segment name
         run: |
-          set -euo pipefail
-          FOUND=0
-          for f in $(grep -rl 'HOOK_DATA_SEGMENT[[:space:]]*=[[:space:]]*"__TITANOX_HOOK"' . 2>/dev/null || true); do
-            echo "patching $f"
-            sed -i.bak 's/HOOK_DATA_SEGMENT[[:space:]]*=[[:space:]]*"__TITANOX_HOOK"/HOOK_DATA_SEGMENT = "__TITANOX_DATA"/g' "$f"
+          grep -rl 'HOOK_DATA_SEGMENT.*"__TITANOX_HOOK"' . 2>/dev/null | while read f; do
+            echo "patch $f"
+            sed -i.bak 's/HOOK_DATA_SEGMENT.*"__TITANOX_HOOK"/HOOK_DATA_SEGMENT = "__TITANOX_DATA"/' "$f"
             rm -f "$f.bak"
-            FOUND=1
           done
-          if [ "$FOUND" = "0" ]; then
-            echo "warning: no target strings found"
-          fi
-          echo "--- result ---"
-          grep -rn 'HOOK_TEXT_SEGMENT\|HOOK_DATA_SEGMENT' . | head -20 || true
+          grep -rn 'HOOK_TEXT_SEGMENT\|HOOK_DATA_SEGMENT' . | head || true
 
-      - name: Commit and push
+      - name: Commit
         run: |
-          set -euo pipefail
-          git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git config user.name "bot"
+          git config user.email "bot@users.noreply.github.com"
           git add -A
-          if git diff --staged --quiet; then
-            echo "no changes to commit"
-          else
-            git commit -m "Vendor Titanox upstream + fix duplicate segment name"
-            git push
-          fi
+          git diff --staged --quiet || git commit -m "vendor titanox"
+          git push
