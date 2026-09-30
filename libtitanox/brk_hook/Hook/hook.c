@@ -37,6 +37,9 @@ struct hook { uintptr_t old; uintptr_t new; };
 static struct hook hooks[16];
 static int active_hooks = 0;
 
+static arm_debug_state64_t g_debug_state = {};
+static int g_debug_slots = 0;
+
 kern_return_t catch_mach_exception_raise_state(
     mach_port_t exception_port, exception_type_t exception,
     const mach_exception_data_t code, mach_msg_type_number_t codeCnt,
@@ -83,12 +86,27 @@ void *exception_handler(void *unused) {
     return NULL;
 }
 
-bool hook(void *old[], void *new[], int count) {
-    if (count > 6) return false;
+static void apply_debug_state_to_all_threads(void) {
+    thread_act_array_t threads;
+    mach_msg_type_number_t thread_count = 0;
+    task_threads(mach_task_self(), &threads, &thread_count);
 
+    for (mach_msg_type_number_t i = 0; i < thread_count; ++i) {
+        thread_set_state(threads[i], ARM_DEBUG_STATE64,
+                         (thread_state_t)&g_debug_state,
+                         ARM_DEBUG_STATE64_COUNT);
+    }
+
+    for (mach_msg_type_number_t i = 0; i < thread_count; ++i) {
+        mach_port_deallocate(mach_task_self(), threads[i]);
+    }
+    vm_deallocate(mach_task_self(), (vm_address_t)threads,
+                  thread_count * sizeof(*threads));
+}
+
+bool hook(void *old[], void *new[], int count) {
     static bool initialized = false;
-    static bool thread_initialized = false;
-    static int breakpoints = 0;
+    static int breakpoints = 6;
 
     if (!initialized) {
         size_t size = sizeof(breakpoints);
@@ -109,71 +127,51 @@ bool hook(void *old[], void *new[], int count) {
             if (port_count > 0) orig_handler_port = current_ports[0];
         }
 
-        kern_return_t kr1 = mach_port_allocate(mach_task_self(), MACH_PORT_RIGHT_RECEIVE, &server);
+        kern_return_t kr1 = mach_port_allocate(mach_task_self(),
+                                                MACH_PORT_RIGHT_RECEIVE, &server);
         OXLogC("PORT_ALLOC", (uint64_t)kr1, (uint64_t)server);
-        kern_return_t kr2 = mach_port_insert_right(mach_task_self(), server, server, MACH_MSG_TYPE_MAKE_SEND);
-        OXLogC("PORT_INSERT", (uint64_t)kr2, 0);
-        kern_return_t kr3 = task_set_exception_ports(mach_task_self(), EXC_MASK_BREAKPOINT, server,
-                                 EXCEPTION_STATE | MACH_EXCEPTION_CODES, ARM_THREAD_STATE64);
+        mach_port_insert_right(mach_task_self(), server, server,
+                               MACH_MSG_TYPE_MAKE_SEND);
+        kern_return_t kr3 = task_set_exception_ports(mach_task_self(),
+                                EXC_MASK_BREAKPOINT, server,
+                                EXCEPTION_STATE | MACH_EXCEPTION_CODES,
+                                ARM_THREAD_STATE64);
         OXLogC("SET_EXC_PORT", (uint64_t)kr3, 0);
 
-        if (!thread_initialized) {
-            pthread_t thread;
-            pthread_create(&thread, NULL, exception_handler, NULL);
-            thread_initialized = true;
-        }
+        pthread_t thread;
+        pthread_create(&thread, NULL, exception_handler, NULL);
         initialized = true;
     }
 
-    if (count > breakpoints) return false;
-    if (active_hooks + count > 16) return false;
+    if (g_debug_slots + count > breakpoints) {
+        OXLogC("NO_SLOTS", (uint64_t)g_debug_slots, (uint64_t)count);
+        return false;
+    }
 
-    arm_debug_state64_t state = {};
     for (int i = 0; i < count; i++) {
-        state.__bvr[i] = (uintptr_t)old[i];
-        state.__bcr[i] = 0x1e5;
+        int slot = g_debug_slots;
+        g_debug_state.__bvr[slot] = (uintptr_t)old[i];
+        g_debug_state.__bcr[slot] = 0x1e5;
         hooks[active_hooks].old = (uintptr_t)old[i];
         hooks[active_hooks].new = (uintptr_t)new[i];
+        g_debug_slots++;
         active_hooks++;
     }
 
     kern_return_t kr4 = task_set_state(mach_task_self(), ARM_DEBUG_STATE64,
-                       (thread_state_t)&state, ARM_DEBUG_STATE64_COUNT);
-    OXLogC("TASK_SET_STATE", (uint64_t)kr4, 0);
+                                       (thread_state_t)&g_debug_state,
+                                       ARM_DEBUG_STATE64_COUNT);
+    OXLogC("TASK_SET_STATE", (uint64_t)kr4, (uint64_t)g_debug_slots);
     if (kr4 != KERN_SUCCESS) return false;
 
-    thread_act_array_t threads;
-    mach_msg_type_number_t thread_count = 0;
-    task_threads(mach_task_self(), &threads, &thread_count);
-    OXLogC("THREAD_COUNT", (uint64_t)thread_count, 0);
+    apply_debug_state_to_all_threads();
+    OXLogC("APPLIED_SLOTS", (uint64_t)g_debug_slots, 0);
 
-    bool success = true;
-    for (mach_msg_type_number_t i = 0; i < thread_count; ++i) {
-        kern_return_t kr5 = thread_set_state(threads[i], ARM_DEBUG_STATE64,
-                             (thread_state_t)&state,
-                             ARM_DEBUG_STATE64_COUNT);
-        if (kr5 != KERN_SUCCESS) {
-            success = false;
-            OXLogC("THREAD_SET_FAIL", (uint64_t)i, (uint64_t)kr5);
-        }
-    }
-
-    for (mach_msg_type_number_t i = 0; i < thread_count; ++i) {
-        mach_port_deallocate(mach_task_self(), threads[i]);
-    }
-    vm_deallocate(mach_task_self(), (vm_address_t)threads,
-                  thread_count * sizeof(*threads));
-
-    return success;
+    return true;
 }
 
 bool unhook(void *old[], int count) {
-    arm_debug_state64_t state = {};
-
     for (int i = 0; i < count; i++) {
-        state.__bvr[i] = 0;
-        state.__bcr[i] = 0;
-
         for (int j = 0; j < active_hooks; j++) {
             if (hooks[j].old == (uintptr_t)old[i]) {
                 hooks[j] = hooks[active_hooks - 1];
@@ -183,24 +181,17 @@ bool unhook(void *old[], int count) {
         }
     }
 
-    thread_act_array_t threads;
-    mach_msg_type_number_t thread_count = 0;
-    task_threads(mach_task_self(), &threads, &thread_count);
-
-    bool success = true;
-    for (mach_msg_type_number_t i = 0; i < thread_count; ++i) {
-        if (thread_set_state(threads[i], ARM_DEBUG_STATE64,
-                             (thread_state_t)&state,
-                             ARM_DEBUG_STATE64_COUNT) != KERN_SUCCESS) {
-            success = false;
-        }
+    memset(&g_debug_state, 0, sizeof(g_debug_state));
+    g_debug_slots = 0;
+    for (int i = 0; i < active_hooks && i < 16; i++) {
+        g_debug_state.__bvr[i] = hooks[i].old;
+        g_debug_state.__bcr[i] = 0x1e5;
+        g_debug_slots++;
     }
 
-    for (mach_msg_type_number_t i = 0; i < thread_count; ++i) {
-        mach_port_deallocate(mach_task_self(), threads[i]);
-    }
-    vm_deallocate(mach_task_self(), (vm_address_t)threads,
-                  thread_count * sizeof(*threads));
+    task_set_state(mach_task_self(), ARM_DEBUG_STATE64,
+                   (thread_state_t)&g_debug_state, ARM_DEBUG_STATE64_COUNT);
+    apply_debug_state_to_all_threads();
 
-    return success;
+    return true;
 }
