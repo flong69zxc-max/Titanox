@@ -139,20 +139,6 @@ void brk_diag_log(const char *format, ...)
     pthread_mutex_unlock(&g_log_lock);
 }
 
-static uint64_t thread_id(mach_port_t thread)
-{
-    thread_identifier_info_data_t info;
-    mach_msg_type_number_t count = THREAD_IDENTIFIER_INFO_COUNT;
-
-    if (thread_info(
-            thread,
-            THREAD_IDENTIFIER_INFO,
-            (thread_info_t)&info,
-            &count) != KERN_SUCCESS) return 0;
-
-    return info.thread_id;
-}
-
 static int task_port_status(void)
 {
     exception_mask_t masks[EXC_TYPES_COUNT];
