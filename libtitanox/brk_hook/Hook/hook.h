@@ -1,66 +1,84 @@
-#ifndef TITANOX_BRK_HOOK_H
-#define TITANOX_BRK_HOOK_H
+#ifndef TITANOX_HOOK_H
+#define TITANOX_HOOK_H
 
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
+#include <mach/mach.h>
 
 #ifdef __cplusplus
 extern "C" {
 #endif
 
-bool hook(void *oldArr[], void *newArr[], int count);
-bool unhook(void *oldArr[], int count);
+FILE *titanox_log_handle(void);
+
+void brk_diag_log(const char *format, ...);
+
+void hook_set_error(const char *format, ...);
+
+const char *hook_last_error(void);
+
+bool hook_sign_check(uintptr_t address);
+
+bool hook_verify_encryption(void *image);
 
 bool brk_install(void *target, void *replacement);
-bool brk_remove(void *target);
+
 bool brk_observe(void *target);
-uint64_t brk_hits(void *target);
 
-void *brk_original_ptr(void *target);
-void brk_suspend_self(void);
-void brk_resume_self(void);
+bool brk_install_raw_slot(int slot, void *target, void *replacement);
 
-int brk_active_count(void);
-int brk_slot_limit(void);
-bool brk_selftest(void);
-void brk_log_state(void);
-
-bool brk_calibrate_slots(void);
-int brk_live_slot_count(void);
-int brk_next_slot(int after);
-
-int brk_census(
-    uint64_t *expected_bvr,
-    int max_slots,
-    int *threads_total
-);
-
-void brk_trace_exception(
-    uint64_t exception,
-    uint64_t code0,
-    uint64_t code1,
-    uint64_t pc,
-    int matched_slot
-);
-
-bool brk_arm_function_rva(
-    uintptr_t image_base,
-    uint64_t rva,
-    void *replacement
-);
-
-bool brk_install_raw_slot(
-    int slot,
-    void *target,
-    void *replacement
-);
+bool brk_remove(void *target);
 
 bool brk_remove_raw(void *target);
+
+uint64_t brk_hits(void *target);
+
+void hook_note_hit(void *target);
+
+void *brk_original_ptr(void *target);
+
+void brk_suspend_self(void);
+
+void brk_resume_self(void);
+
+int brk_slot_limit(void);
+
+int brk_live_slot_count(void);
+
+int brk_active_count(void);
+
+bool brk_calibrate_slots(void);
+
+int brk_next_slot(int after);
+
+bool brk_selftest(void);
+
 void *brk_selftest_addr(void);
 
-FILE *titanox_log_handle(void);
-void brk_diag_log(const char *format, ...);
+void hook_selftest_probe(void);
+
+void brk_log_state(void);
+
+int brk_census(uint64_t *outHits, uint64_t *outFails, int *outLive);
+
+void brk_trace_exception(const char *label);
+
+bool brk_host_is_livecontainer(void);
+
+bool brk_chain_active(void);
+
+mach_port_t brk_previous_port(void);
+
+uint64_t brk_chain_counters(uint64_t *fails);
+
+bool brk_arm_function_rva(uintptr_t imageBase, uintptr_t rva, void *replacement, void **outOriginal);
+
+void brk_teardown(void);
+
+bool hook(void *oldArr[], void *newArr[], int count);
+
+bool unhook(void *oldArr[], int count);
 
 #ifdef __cplusplus
 }
