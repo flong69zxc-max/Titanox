@@ -8,6 +8,7 @@
 #include <stdint.h>
 #include <stdarg.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
@@ -52,11 +53,15 @@ static FILE *g_logf = NULL;
 
 FILE *titanox_log_handle(void) {
     if (g_logf) return g_logf;
-    NSString *docs = [NSHomeDirectory() stringByAppendingPathComponent:@"Documents"];
-    [[NSFileManager defaultManager] createDirectoryAtPath:docs
-                              withIntermediateDirectories:YES attributes:nil error:nil];
-    NSString *p = [docs stringByAppendingPathComponent:@"Titanox.log"];
-    g_logf = fopen(p.UTF8String, "a");
+
+    const char *home = getenv("HOME");
+    char path[1024];
+    if (home) {
+        snprintf(path, sizeof(path), "%s/Documents/Titanox.log", home);
+    } else {
+        snprintf(path, sizeof(path), "/tmp/Titanox.log");
+    }
+    g_logf = fopen(path, "a");
     return g_logf;
 }
 
@@ -90,9 +95,6 @@ static void *brk_sign(uintptr_t raw) {
 #endif
 }
 
-extern bool brk_install(void *target, void *replacement);
-extern bool brk_remove(void *target);
-
 static volatile int g_probe_hits;
 
 __attribute__((noinline)) static void brk_probe_target(void) {
@@ -105,9 +107,6 @@ __attribute__((noinline)) static void brk_probe_replacement(void) {
 void *brk_selftest_addr(void) {
     return (void *)&brk_probe_target;
 }
-
-bool brk_install_raw_slot(int slot, void *target, void *replacement);
-bool brk_remove_raw(void *target);
 
 kern_return_t catch_mach_exception_raise(
     mach_port_t exception_port, mach_port_t thread, mach_port_t task,
@@ -137,14 +136,12 @@ kern_return_t catch_mach_exception_raise_state(
 
     uintptr_t pc = (uintptr_t)arm_thread_state64_get_pc(*oldSt);
     uintptr_t dest = 0;
-    int matched = -1;
 
     pthread_mutex_lock(&g_lock);
     for (int i = 0; i < g_entry_count; i++) {
         if (!g_entries[i].used) continue;
         if (g_entries[i].target == pc) {
             dest = g_entries[i].replacement;
-            matched = i;
             break;
         }
     }
@@ -179,6 +176,9 @@ static void *brk_exception_thread(void *arg) {
     }
     return NULL;
 }
+
+bool brk_install_raw_slot(int slot, void *target, void *replacement);
+bool brk_remove_raw(void *target);
 
 bool brk_calibrate_slots(void) {
     uint32_t mask = 0;
@@ -485,14 +485,10 @@ bool brk_remove(void *target) {
 }
 
 bool brk_install_raw_slot(int slot, void *target, void *replacement) {
+    (void)replacement;
     if (slot < 0 || slot >= BRK_SLOT_CAP) return false;
     if (!g_ready) brk_init();
     if (!g_ready) return false;
-
-    arm_debug_state64_t st;
-    memset(&st, 0, sizeof(st));
-    st.__bvr[slot] = (uint64_t)target;
-    st.__bcr[slot] = (uint32_t)BRK_BCR_VALUE;
 
     task_t task = mach_task_self();
     thread_act_array_t threads = NULL;
