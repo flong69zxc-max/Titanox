@@ -111,6 +111,36 @@ static bool hook_region_info(uintptr_t address, vm_prot_t *prot, uintptr_t *star
     return true;
 }
 
+static bool hook_region_maxprot(uintptr_t address, vm_prot_t *outMax)
+{
+    if (!address) return false;
+
+    vm_address_t region = (vm_address_t)address;
+    vm_size_t size = 0;
+    vm_region_basic_info_data_64_t info;
+    mach_msg_type_number_t count = VM_REGION_BASIC_INFO_COUNT_64;
+    mach_port_t object = MACH_PORT_NULL;
+
+    kern_return_t kr = vm_region_64(
+        mach_task_self(),
+        &region,
+        &size,
+        VM_REGION_BASIC_INFO_64,
+        (vm_region_info_t)&info,
+        &count,
+        &object
+    );
+
+    if (object != MACH_PORT_NULL) {
+        mach_port_deallocate(mach_task_self(), object);
+    }
+
+    if (kr != KERN_SUCCESS || size == 0) return false;
+
+    if (outMax) *outMax = info.max_protection;
+    return true;
+}
+
 bool hook_sign_check(uintptr_t address)
 {
     if (!address) return false;
@@ -310,18 +340,39 @@ static bool hook_page_writable(uintptr_t address, size_t length, vm_prot_t *save
 
     if (saved) *saved = prot;
 
+    vm_prot_t maxProt = 0;
+
+    if (!hook_region_maxprot(address, &maxProt)) {
+        hook_set_error("write: cannot read maxprot at %p", (void *)start);
+        return false;
+    }
+
+    if ((maxProt & VM_PROT_WRITE) == 0) {
+        hook_set_error("write: refusing %p, maxprot=%c%c%c has no WRITE",
+                       (void *)start,
+                       (maxProt & VM_PROT_READ) ? 'r' : '-',
+                       (maxProt & VM_PROT_WRITE) ? 'w' : '-',
+                       (maxProt & VM_PROT_EXECUTE) ? 'x' : '-');
+        g_fail_count++;
+        return false;
+    }
+
     if (prot & VM_PROT_WRITE) return true;
 
-    hook_page_set(start, 1, (vm_prot_t)(VM_PROT_READ | VM_PROT_WRITE | VM_PROT_EXECUTE), TRUE, NULL);
+    vm_prot_t raised = (vm_prot_t)(maxProt | VM_PROT_READ | VM_PROT_WRITE);
 
-    vm_prot_t writable = (vm_prot_t)(VM_PROT_COPY | VM_PROT_READ | VM_PROT_WRITE);
+    if (!hook_page_set(start, 1, raised, TRUE, NULL)) {
+        hook_set_error("write: cannot raise maxprot at %p", (void *)start);
+        g_fail_count++;
+        return false;
+    }
 
     kern_return_t kr = vm_protect(
         mach_task_self(),
         (vm_address_t)start,
         (vm_size_t)(end - start),
         FALSE,
-        writable
+        (vm_prot_t)(VM_PROT_COPY | VM_PROT_READ | VM_PROT_WRITE)
     );
 
     if (kr == KERN_SUCCESS) return true;
@@ -336,6 +387,11 @@ static bool hook_page_writable(uintptr_t address, size_t length, vm_prot_t *save
         (vm_prot_t)(VM_PROT_READ | VM_PROT_WRITE)
     );
 
+    if (kr != KERN_SUCCESS) {
+        hook_set_error("write: rw transition failed at %p kr=%d", (void *)start, kr);
+        g_fail_count++;
+    }
+
     return kr == KERN_SUCCESS;
 }
 
@@ -348,9 +404,6 @@ static bool hook_page_restore(uintptr_t address, vm_prot_t saved)
     if (!hook_region_info(address, &prot, &start, &end)) return false;
 
     vm_prot_t target = (vm_prot_t)(saved & ~VM_PROT_WRITE);
-    if ((saved & VM_PROT_EXECUTE) == 0) target = saved;
-
-    hook_page_set(start, 1, (vm_prot_t)(VM_PROT_READ | VM_PROT_WRITE | VM_PROT_EXECUTE), TRUE, NULL);
 
     kern_return_t kr = vm_protect(
         mach_task_self(),
@@ -359,6 +412,10 @@ static bool hook_page_restore(uintptr_t address, vm_prot_t saved)
         FALSE,
         target
     );
+
+    if (kr != KERN_SUCCESS) {
+        hook_set_error("restore: failed at %p kr=%d", (void *)start, kr);
+    }
 
     return kr == KERN_SUCCESS;
 }
@@ -386,13 +443,22 @@ void hook_log_prot(const char *label, uintptr_t address)
         return;
     }
 
-    brk_diag_log("%s %p prot=%c%c%c max-ok=%d",
+    vm_prot_t maxProt = 0;
+
+    if (!hook_region_maxprot(address, &maxProt)) maxProt = 0;
+
+    brk_diag_log("%s %p-%p cur=%c%c%c max=%c%c%c writable=%d executable=%d",
                  label ? label : "prot",
-                 (void *)address,
+                 (void *)start,
+                 (void *)end,
                  (prot & VM_PROT_READ) ? 'r' : '-',
                  (prot & VM_PROT_WRITE) ? 'w' : '-',
                  (prot & VM_PROT_EXECUTE) ? 'x' : '-',
-                 (prot & VM_PROT_EXECUTE) ? 1 : 0);
+                 (maxProt & VM_PROT_READ) ? 'r' : '-',
+                 (maxProt & VM_PROT_WRITE) ? 'w' : '-',
+                 (maxProt & VM_PROT_EXECUTE) ? 'x' : '-',
+                 (maxProt & VM_PROT_WRITE) ? 1 : 0,
+                 (maxProt & VM_PROT_EXECUTE) ? 1 : 0);
 }
 
 static bool hook_make_executable(uintptr_t address, size_t length)
@@ -407,7 +473,11 @@ static bool hook_make_executable(uintptr_t address, size_t length)
     if ((address + length) > end) return false;
 
     if ((prot & VM_PROT_EXECUTE) == 0) {
-        hook_page_set(start, 1, (vm_prot_t)(VM_PROT_READ | VM_PROT_WRITE | VM_PROT_EXECUTE), TRUE, NULL);
+        vm_prot_t maxProt = 0;
+
+        if (!hook_region_maxprot(address, &maxProt)) maxProt = prot;
+
+        hook_page_set(start, 1, (vm_prot_t)(maxProt | VM_PROT_READ | VM_PROT_EXECUTE), TRUE, NULL);
 
         kern_return_t kr = vm_protect(
             mach_task_self(),
@@ -834,6 +904,16 @@ static uintptr_t hook_alloc_from_cave(uintptr_t target, size_t size, bool *near)
     if (!hook_region_info(target, &prot, &regionStart, &regionEnd)) return 0;
     if ((prot & VM_PROT_EXECUTE) == 0) return 0;
 
+    vm_prot_t maxProt = 0;
+
+    if (!hook_region_maxprot(target, &maxProt)) return 0;
+
+    if ((maxProt & VM_PROT_WRITE) == 0) {
+        brk_diag_log("trampoline: region %p-%p maxprot has no WRITE, cave unusable",
+                     (void *)regionStart, (void *)regionEnd);
+        return 0;
+    }
+
     uintptr_t floor = regionStart + 0x4000;
     if (floor >= regionEnd) return 0;
 
@@ -964,6 +1044,25 @@ bool brk_install(void *target, void *replacement)
 
     if ((prot & VM_PROT_EXECUTE) == 0) {
         hook_set_error("install: target %p not executable (prot=%d)", (void *)addr, (int)prot);
+        g_fail_count++;
+        return false;
+    }
+
+    vm_prot_t maxProt = 0;
+
+    if (!hook_region_maxprot(addr, &maxProt)) {
+        hook_set_error("install: cannot read maxprot for %p", (void *)addr);
+        g_fail_count++;
+        return false;
+    }
+
+    if ((maxProt & VM_PROT_WRITE) == 0) {
+        hook_set_error("install: refusing %p, region maxprot=%c%c%c has no WRITE",
+                       (void *)addr,
+                       (maxProt & VM_PROT_READ) ? 'r' : '-',
+                       (maxProt & VM_PROT_WRITE) ? 'w' : '-',
+                       (maxProt & VM_PROT_EXECUTE) ? 'x' : '-');
+        g_fail_count++;
         return false;
     }
 
