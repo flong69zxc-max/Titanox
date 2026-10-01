@@ -311,28 +311,28 @@ static bool hook_page_writable(uintptr_t address, size_t length, vm_prot_t *save
 
     if (prot & VM_PROT_WRITE) return true;
 
-    vm_prot_t copy = (vm_prot_t)(prot | VM_PROT_COPY | VM_PROT_WRITE | VM_PROT_READ);
+    hook_page_set(start, 1, (vm_prot_t)(VM_PROT_READ | VM_PROT_WRITE | VM_PROT_EXECUTE), TRUE, NULL);
+
+    vm_prot_t writable = (vm_prot_t)(VM_PROT_COPY | VM_PROT_READ | VM_PROT_WRITE);
 
     kern_return_t kr = vm_protect(
         mach_task_self(),
         (vm_address_t)start,
         (vm_size_t)(end - start),
         FALSE,
-        copy
+        writable
     );
 
     if (kr == KERN_SUCCESS) return true;
 
-    brk_diag_log("page VM_PROT_COPY failed kr=%d errno=%d, escalating to RWX", kr, errno);
-
-    hook_page_set(start, 1, (vm_prot_t)(VM_PROT_READ | VM_PROT_WRITE | VM_PROT_EXECUTE), TRUE, NULL);
+    brk_diag_log("page rw+copy failed kr=%d errno=%d, retrying rw only", kr, errno);
 
     kr = vm_protect(
         mach_task_self(),
         (vm_address_t)start,
         (vm_size_t)(end - start),
         FALSE,
-        (vm_prot_t)(VM_PROT_READ | VM_PROT_WRITE | VM_PROT_EXECUTE)
+        (vm_prot_t)(VM_PROT_READ | VM_PROT_WRITE)
     );
 
     return kr == KERN_SUCCESS;
@@ -362,6 +362,86 @@ static bool hook_page_restore(uintptr_t address, vm_prot_t saved)
     return kr == KERN_SUCCESS;
 }
 
+static bool hook_page_executable(uintptr_t address, size_t length)
+{
+    vm_prot_t prot = 0;
+    uintptr_t start = 0;
+    uintptr_t end = 0;
+
+    if (!hook_region_info(address, &prot, &start, &end)) return false;
+    if ((address + length) > end) return false;
+
+    return (prot & VM_PROT_EXECUTE) ? true : false;
+}
+
+void hook_log_prot(const char *label, uintptr_t address)
+{
+    vm_prot_t prot = 0;
+    uintptr_t start = 0;
+    uintptr_t end = 0;
+
+    if (!hook_region_info(address, &prot, &start, &end)) {
+        brk_diag_log("%s %p prot=unmapped", label ? label : "prot", (void *)address);
+        return;
+    }
+
+    brk_diag_log("%s %p prot=%c%c%c max-ok=%d",
+                 label ? label : "prot",
+                 (void *)address,
+                 (prot & VM_PROT_READ) ? 'r' : '-',
+                 (prot & VM_PROT_WRITE) ? 'w' : '-',
+                 (prot & VM_PROT_EXECUTE) ? 'x' : '-',
+                 (prot & VM_PROT_EXECUTE) ? 1 : 0);
+}
+
+static bool hook_make_executable(uintptr_t address, size_t length)
+{
+    if (!address || !length) return false;
+
+    vm_prot_t prot = 0;
+    uintptr_t start = 0;
+    uintptr_t end = 0;
+
+    if (!hook_region_info(address, &prot, &start, &end)) return false;
+    if ((address + length) > end) return false;
+
+    if ((prot & VM_PROT_EXECUTE) == 0) {
+        hook_page_set(start, 1, (vm_prot_t)(VM_PROT_READ | VM_PROT_WRITE | VM_PROT_EXECUTE), TRUE, NULL);
+
+        kern_return_t kr = vm_protect(
+            mach_task_self(),
+            (vm_address_t)start,
+            (vm_size_t)(end - start),
+            FALSE,
+            (vm_prot_t)(VM_PROT_READ | VM_PROT_EXECUTE)
+        );
+
+        if (kr != KERN_SUCCESS) {
+            hook_set_error("exec: vm_protect RX failed at %p kr=%d errno=%d", (void *)start, kr, errno);
+            return false;
+        }
+    }
+
+    sys_icache_invalidate((void *)address, length);
+
+    vm_prot_t after = 0;
+    uintptr_t start2 = 0;
+    uintptr_t end2 = 0;
+
+    if (!hook_region_info(address, &after, &start2, &end2)) return false;
+
+    if ((after & VM_PROT_EXECUTE) == 0) {
+        hook_set_error("exec: %p still lacks EXECUTE (prot=%d)", (void *)start, (int)after);
+        return false;
+    }
+
+    if (after & VM_PROT_WRITE) {
+        brk_diag_log("exec: %p is still writable after RX transition (prot=%d)", (void *)start, (int)after);
+    }
+
+    return true;
+}
+
 static bool hook_write_bytes(uintptr_t address, const void *data, size_t length)
 {
     if (!address || !data || !length) return false;
@@ -375,9 +455,14 @@ static bool hook_write_bytes(uintptr_t address, const void *data, size_t length)
 
     memcpy((void *)address, data, length);
 
+    hook_page_restore(address, saved);
+
     sys_icache_invalidate((void *)address, length);
 
-    hook_page_restore(address, saved);
+    if ((saved & VM_PROT_EXECUTE) && !hook_page_executable(address, length)) {
+        hook_set_error("write: %p lost EXECUTE after restore", (void *)address);
+        return false;
+    }
 
     uint8_t verify[HOOK_PATCH_SIZE];
 
@@ -676,7 +761,7 @@ static uintptr_t hook_alloc_trampoline(uintptr_t target, size_t size, bool *near
 {
     if (near) *near = false;
 
-    void *mapped = mmap(NULL, size, PROT_READ | PROT_WRITE | PROT_EXEC,
+    void *mapped = mmap(NULL, size, PROT_READ | PROT_WRITE,
                         MAP_PRIVATE | MAP_ANON, -1, 0);
 
     if (mapped != MAP_FAILED) {
@@ -706,7 +791,7 @@ static uintptr_t hook_alloc_trampoline(uintptr_t target, size_t size, bool *near
             if (kr != KERN_SUCCESS) continue;
 
             vm_protect(mach_task_self(), candidate, size, FALSE,
-                       VM_PROT_READ | VM_PROT_WRITE | VM_PROT_EXECUTE);
+                       VM_PROT_READ | VM_PROT_WRITE);
 
             if (near) *near = true;
             brk_diag_log("trampoline fixed alloc tramp=%p", (void *)candidate);
@@ -716,7 +801,7 @@ static uintptr_t hook_alloc_trampoline(uintptr_t target, size_t size, bool *near
 
     size_t bigger = size * 4;
 
-    mapped = mmap(NULL, bigger, PROT_READ | PROT_WRITE | PROT_EXEC,
+    mapped = mmap(NULL, bigger, PROT_READ | PROT_WRITE,
                   MAP_PRIVATE | MAP_ANON, -1, 0);
 
     if (mapped == MAP_FAILED) {
@@ -874,7 +959,19 @@ bool brk_install(void *target, void *replacement)
     size_t trampBytes = (size_t)blockSize + HOOK_PATCH_SIZE;
 
     memcpy((void *)tramp, trampoline, trampBytes);
-    sys_icache_invalidate((void *)tramp, trampBytes);
+
+    hook_log_prot("trampoline before RX", tramp);
+
+    if (!hook_make_executable(tramp, trampBytes)) {
+        hook_log_prot("trampoline after RX failed", tramp);
+        vm_deallocate(mach_task_self(), (vm_address_t)tramp, (vm_size_t)HOOK_TRAMP_SIZE);
+        entry->used = false;
+        pthread_mutex_unlock(&g_lock);
+        hook_set_error("install: trampoline at %p is not executable", (void *)tramp);
+        return false;
+    }
+
+    hook_log_prot("trampoline after RX", tramp);
 
     uint8_t patch[HOOK_PATCH_SIZE];
     hook_build_patch(repl, patch);
@@ -1085,7 +1182,7 @@ bool brk_selftest(void)
     g_selftest_hits = 0;
 
     void *page = mmap(NULL, 0x4000,
-                      PROT_READ | PROT_WRITE | PROT_EXEC,
+                      PROT_READ | PROT_WRITE,
                       MAP_PRIVATE | MAP_ANON, -1, 0);
 
     if (page == MAP_FAILED) {
@@ -1099,7 +1196,17 @@ bool brk_selftest(void)
     code[2] = 0xD65F03C0u;
 
     memcpy(page, code, sizeof(code));
-    sys_icache_invalidate(page, sizeof(code));
+
+    hook_log_prot("selftest page before RX", (uintptr_t)page);
+
+    if (!hook_make_executable((uintptr_t)page, sizeof(code))) {
+        hook_log_prot("selftest page after RX failed", (uintptr_t)page);
+        hook_set_error("selftest: generated code cannot be made executable");
+        munmap(page, 0x4000);
+        return false;
+    }
+
+    hook_log_prot("selftest page after RX", (uintptr_t)page);
 
     g_selftest_call = (hook_selftest_fn)sign_fn((uintptr_t)page);
 
