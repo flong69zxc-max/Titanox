@@ -54,6 +54,7 @@ static FILE *g_log = NULL;
 static long g_log_bytes = 0;
 static uint64_t g_total_hits = 0;
 static uint64_t g_fail_count = 0;
+static kern_return_t g_last_kr = 0;
 static uint64_t g_install_count = 0;
 static bool g_ready = false;
 static char g_last_error[256];
@@ -334,6 +335,8 @@ static bool hook_page_set(uintptr_t address, size_t length, vm_prot_t requested,
         requested
     );
 
+    g_last_kr = kr;
+
     return kr == KERN_SUCCESS;
 }
 
@@ -420,13 +423,35 @@ static bool hook_page_writable(uintptr_t address, size_t length, vm_prot_t *save
 static bool hook_page_restore(uintptr_t address, size_t length, vm_prot_t saved)
 {
     vm_prot_t target = (vm_prot_t)(saved & ~VM_PROT_WRITE);
+    vm_prot_t maxProt = 0;
 
-    if (!hook_page_set(address, length, target, FALSE, NULL)) {
-        hook_set_error("restore: failed at %p", (void *)address);
-        return false;
+    if (hook_page_set(address, length, target, FALSE, NULL)) return true;
+
+    brk_diag_log("restore: plain r-x failed kr=%d at %p", (int)g_last_kr, (void *)address);
+
+    if (hook_page_set(address, length, (vm_prot_t)(target | VM_PROT_COPY), FALSE, NULL)) {
+        brk_diag_log("restore: COPY|r-x ok at %p", (void *)address);
+        return true;
     }
 
-    return true;
+    brk_diag_log("restore: COPY|r-x failed kr=%d at %p", (int)g_last_kr, (void *)address);
+
+    if (hook_region_maxprot(address, &maxProt) && (maxProt & VM_PROT_EXECUTE)) {
+        if (hook_page_set(address, length,
+                          (vm_prot_t)(maxProt | VM_PROT_READ | VM_PROT_WRITE), TRUE, NULL) &&
+            hook_page_set(address, length, target, FALSE, NULL)) {
+            brk_diag_log("restore: maxprot rwx then r-x ok at %p", (void *)address);
+            return true;
+        }
+
+        brk_diag_log("restore: maxprot rwx path failed kr=%d at %p", (int)g_last_kr, (void *)address);
+    } else {
+        brk_diag_log("restore: maxprot at %p has no EXECUTE", (void *)address);
+    }
+
+    hook_set_error("restore: failed at %p kr=%d", (void *)address, (int)g_last_kr);
+
+    return false;
 }
 
 static bool hook_page_executable(uintptr_t address, size_t length)
