@@ -55,6 +55,7 @@ static long g_log_bytes = 0;
 static uint64_t g_total_hits = 0;
 static uint64_t g_fail_count = 0;
 static kern_return_t g_last_kr = 0;
+static bool g_exec_restore_broken = false;
 static uint64_t g_install_count = 0;
 static bool g_ready = false;
 static char g_last_error[256];
@@ -378,12 +379,31 @@ static bool hook_page_writable(uintptr_t address, size_t length, vm_prot_t *save
 
     if (prot & VM_PROT_WRITE) return true;
 
-    vm_prot_t raised = (vm_prot_t)(maxProt | VM_PROT_READ | VM_PROT_WRITE);
+    brk_diag_log("write: %p cur=%c%c%c max=%c%c%c",
+                 (void *)address,
+                 (prot & VM_PROT_READ) ? 'r' : '-',
+                 (prot & VM_PROT_WRITE) ? 'w' : '-',
+                 (prot & VM_PROT_EXECUTE) ? 'x' : '-',
+                 (maxProt & VM_PROT_READ) ? 'r' : '-',
+                 (maxProt & VM_PROT_WRITE) ? 'w' : '-',
+                 (maxProt & VM_PROT_EXECUTE) ? 'x' : '-');
 
-    if (!hook_page_set(address, length, raised, TRUE, NULL)) {
-        hook_set_error("write: cannot raise maxprot at %p", (void *)start);
-        g_fail_count++;
-        return false;
+    if ((maxProt & (VM_PROT_READ | VM_PROT_WRITE)) != (VM_PROT_READ | VM_PROT_WRITE) ||
+        (maxProt & VM_PROT_EXECUTE) != (prot & VM_PROT_EXECUTE)) {
+        vm_prot_t raised = (vm_prot_t)(maxProt | VM_PROT_READ | VM_PROT_WRITE |
+                                       (prot & VM_PROT_EXECUTE));
+
+        if (!hook_page_set(address, length, raised, TRUE, NULL)) {
+            hook_set_error("write: cannot raise maxprot at %p", (void *)start);
+            g_fail_count++;
+            return false;
+        }
+
+        brk_diag_log("write: maxprot raised to %c%c%c at %p",
+                     (raised & VM_PROT_READ) ? 'r' : '-',
+                     (raised & VM_PROT_WRITE) ? 'w' : '-',
+                     (raised & VM_PROT_EXECUTE) ? 'x' : '-',
+                     (void *)address);
     }
 
     uintptr_t pageStart = address & ~(uintptr_t)0xFFF;
@@ -570,6 +590,8 @@ static bool hook_write_bytes(uintptr_t address, const void *data, size_t length)
     sys_icache_invalidate((void *)address, length);
 
     if ((saved & VM_PROT_EXECUTE) && !hook_page_executable(address, length)) {
+        g_exec_restore_broken = true;
+
         hook_set_error("write: %p lost EXECUTE after restore", (void *)address);
         return false;
     }
@@ -1116,6 +1138,7 @@ bool hook_code_patch_allowed(void)
 {
     const char *flag = getenv("TITANOX_ALLOW_CODE_PATCH");
 
+    if (g_exec_restore_broken) return false;
     if (flag && flag[0] == '0') return false;
 
     return true;
