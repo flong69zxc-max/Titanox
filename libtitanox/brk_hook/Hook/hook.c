@@ -1158,10 +1158,16 @@ static bool hook_write_u64(uintptr_t address, uintptr_t value)
     return check == value;
 }
 
-static int hook_scan_tables(uintptr_t imageBase, uintptr_t target, uintptr_t replacement,
-                            uintptr_t *slots, int capacity)
+static uint64_t g_scan_segments = 0;
+static uint64_t g_scan_bytes = 0;
+static uint64_t g_scan_values = 0;
+static uint64_t g_scan_matches = 0;
+static uint64_t g_scan_slots_used = 0;
+
+static int hook_scan_tables_value(uintptr_t imageBase, uintptr_t needle, uintptr_t replacement,
+                                  uintptr_t *slots, int capacity, bool dryRun, const char *label)
 {
-    if (!imageBase || !target || !slots || capacity <= 0) return 0;
+    if (!imageBase || !needle || !slots || capacity <= 0) return 0;
 
     const struct mach_header_64 *header = (const struct mach_header_64 *)imageBase;
 
@@ -1173,6 +1179,7 @@ static int hook_scan_tables(uintptr_t imageBase, uintptr_t target, uintptr_t rep
     const uint8_t *limit = cursor + header->sizeofcmds;
     uintptr_t textVmaddr = 0;
     bool haveText = false;
+    int segments = 0;
 
     for (uint32_t c = 0; c < header->ncmds; c++) {
         if (cursor + sizeof(struct load_command) > limit) break;
@@ -1202,7 +1209,7 @@ static int hook_scan_tables(uintptr_t imageBase, uintptr_t target, uintptr_t rep
 
     cursor = (const uint8_t *)(header + 1);
 
-    for (uint32_t c = 0; c < header->ncmds && hits < capacity; c++) {
+    for (uint32_t c = 0; c < header->ncmds; c++) {
         if (cursor + sizeof(struct load_command) > limit) break;
 
         const struct load_command *cmd = (const struct load_command *)cursor;
@@ -1223,30 +1230,64 @@ static int hook_scan_tables(uintptr_t imageBase, uintptr_t target, uintptr_t rep
         uintptr_t start = (uintptr_t)seg->vmaddr + slide;
         uintptr_t end = start + (uintptr_t)seg->vmsize;
 
-        for (uintptr_t p = start; (p + 8) <= end && hits < capacity; ) {
+        if (segments < 16) {
+            brk_diag_log("scan %s seg %s %p-%p size=%llu initprot=%d",
+                         label ? label : "?",
+                         seg->segname,
+                         (void *)start,
+                         (void *)end,
+                         (unsigned long long)seg->vmsize,
+                         (int)seg->initprot);
+        }
+
+        segments++;
+        g_scan_segments++;
+
+        for (uintptr_t p = start; (p + 8) <= end; ) {
             size_t want = sizeof(buffer);
             if ((p + want) > end) want = (size_t)(end - p);
             if (want < 8) break;
 
             if (!hook_read_bytes(p, buffer, want)) { p += 0x1000; continue; }
 
+            g_scan_bytes += (uint64_t)want;
+
             for (size_t i = 0; (i + 8) <= want; i += 8) {
                 uintptr_t value = 0;
                 memcpy(&value, buffer + i, 8);
 
-                if (value != target) continue;
+                g_scan_values++;
+
+                if (value != needle) continue;
+
+                g_scan_matches++;
+
+                if (hits >= capacity) continue;
 
                 uintptr_t slot = p + i;
+
+                if (dryRun) {
+                    slots[hits] = slot;
+                    hits++;
+
+                    brk_diag_log("scan %s dry-run slot %p in %s holds %p",
+                                 label ? label : "?",
+                                 (void *)slot,
+                                 seg->segname,
+                                 (void *)needle);
+
+                    continue;
+                }
 
                 if (!hook_write_u64(slot, replacement)) continue;
 
                 slots[hits] = slot;
                 hits++;
+                g_scan_slots_used++;
 
-                brk_diag_log("pointer slot %p referenced %p -> %p",
-                             (void *)slot, (void *)target, (void *)replacement);
-
-                if (hits >= capacity) break;
+                brk_diag_log("pointer slot %p in %s referenced %p -> %p",
+                             (void *)slot, seg->segname,
+                             (void *)needle, (void *)replacement);
             }
 
             p += want;
@@ -1289,10 +1330,39 @@ static int hook_pointer_install(uintptr_t target, uintptr_t replacement)
     }
 
     uintptr_t slots[HOOK_PTR_SLOTS];
-    int hits = hook_scan_tables(imageBase, target, replacement, slots, HOOK_PTR_SLOTS);
+    int hits = hook_scan_tables_value(imageBase, target, replacement, slots, HOOK_PTR_SLOTS, false, "addr");
+
+    int offsetHits = 0;
+    uintptr_t offsetSlots[HOOK_PTR_SLOTS];
+
+    if (hits <= 0 && target > imageBase) {
+        offsetHits = hook_scan_tables_value(imageBase, target - imageBase, 0,
+                                            offsetSlots, HOOK_PTR_SLOTS, true, "offset");
+    }
+
+    brk_diag_log("pointer scan target=%p image=%p addr_hits=%d offset_hits=%d segments=%llu bytes=%llu values=%llu matches=%llu",
+                 (void *)target,
+                 (void *)imageBase,
+                 hits,
+                 offsetHits,
+                 (unsigned long long)g_scan_segments,
+                 (unsigned long long)g_scan_bytes,
+                 (unsigned long long)g_scan_values,
+                 (unsigned long long)g_scan_matches);
+
+    g_scan_segments = 0;
+    g_scan_bytes = 0;
+    g_scan_values = 0;
+    g_scan_matches = 0;
 
     if (hits <= 0) {
-        hook_set_error("pointer hook: no writable slot references %p", (void *)target);
+        if (offsetHits > 0) {
+            hook_set_error("pointer hook: %p not stored as VA, but %d unslid-offset slot(s) found (dry run)",
+                           (void *)target, offsetHits);
+        } else {
+            hook_set_error("pointer hook: no writable slot references %p", (void *)target);
+        }
+
         return 0;
     }
 
