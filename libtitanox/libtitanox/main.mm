@@ -17,6 +17,9 @@ bool brk_host_is_livecontainer(void);
 mach_port_t brk_previous_port(void);
 uint64_t brk_chain_counters(uint64_t *fails);
 void brk_teardown(void);
+void *brk_original_ptr(void *target);
+const char *hook_last_error(void);
+bool hook_verify_encryption(void *image);
 }
 
 static const char *TitanoxProtectedSymbols[] = {
@@ -155,14 +158,16 @@ intptr_t GetVmAddrSlide(const char* libName) {
         return NO;
     }
     if (TitanoxHostIsLiveContainer()) {
-        THLog(@"[BRK] host=livecontainer previous_port=%u chained=%d",
-              (unsigned)brk_previous_port(), brk_chain_active() ? 1 : 0);
+        THLog(@"[HOOK] host=livecontainer observed_port=%u inline=1",
+              (unsigned)brk_previous_port());
     }
     if (!HookWrapper::install(original, hook)) {
-        THLog(@"[ERROR] brk_install failed for %p (slots %d/%d)", original, brk_active_count(), brk_slot_limit());
+        THLog(@"[ERROR] inline install failed for %p (%d/%d slots) error=%s",
+              original, brk_active_count(), brk_slot_limit(), hook_last_error());
         return NO;
     }
-    THLog(@"[BRK] hooked %p -> %p (%d/%d slots)", original, hook, brk_active_count(), brk_slot_limit());
+    THLog(@"[HOOK] patched %p -> %p tramp=%p (%d/%d slots)",
+          original, hook, brk_original_ptr(original), brk_active_count(), brk_slot_limit());
     return YES;
 }
 
@@ -700,8 +705,8 @@ intptr_t GetVmAddrSlide(const char* libName) {
     }
 
     if (info.protection & VM_PROT_EXECUTE) {
-        THLog(@"Error: refusing to patch executable memory.");
-        return NO;
+        THLog(@"[HOOK] patching executable region at %p (inline patch path).", address);
+        return YES;
     }
 
     return (info.protection & VM_PROT_WRITE) ? YES : NO;
