@@ -8,8 +8,8 @@
 extern "C" {
 #endif
 
-bool hook(void *old[], void *new[], int count);
-bool unhook(void *old[], int count);
+bool hook(void *oldArr[], void *newArr[], int count);
+bool unhook(void *oldArr[], int count);
 
 bool brk_install(void *target, void *replacement);
 bool brk_remove(void *target);
