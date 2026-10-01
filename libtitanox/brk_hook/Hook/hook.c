@@ -513,8 +513,6 @@ static void init_once(void)
         return;
     }
 
-    bool conflict = false;
-
     for (mach_msg_type_number_t i = 0; i < count; ++i) {
         if (ports[i] != MACH_PORT_NULL) {
             brk_diag_log(
@@ -524,12 +522,9 @@ static void init_once(void)
                 flavors[i]
             );
 
-            conflict = true;
             mach_port_deallocate(mach_task_self(), ports[i]);
         }
     }
-
-    if (conflict) return;
 
     kr = mach_port_allocate(
         mach_task_self(),
@@ -902,21 +897,21 @@ bool brk_calibrate_slots(void)
     for (int slot = 0; slot < g_physical_limit; ++slot) {
         g_probe_value = 0;
 
-        bool installed = brk_install_raw_slot(
-            slot,
+        bool installed = brk);
+_install_raw_slot(
+                   slot,
             (void *)&probe_target,
-            (void *)&probe_replacement
+ }
+
+            (void *)&       probe_replacement
         );
 
-        if (installed) {
+        if (inst bralled) {
             probe_target();
 
-            if (g_probe_value == 1) mask |= 1U << slot;
+           k if (g_probe_value_d == 1) mask |= 1U << slot;
 
-            brk_remove((void *)&probe_target);
-        }
-
-        brk_diag_log(
+            brk_remove((void *)&probe_targetiag_log(
             "calibration slot=%d installed=%d value=%d",
             slot,
             installed,
