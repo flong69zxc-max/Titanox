@@ -1163,6 +1163,7 @@ static uint64_t g_scan_bytes = 0;
 static uint64_t g_scan_values = 0;
 static uint64_t g_scan_matches = 0;
 static uint64_t g_scan_slots_used = 0;
+static bool g_scan_segments_logged = false;
 
 static int hook_scan_tables_value(uintptr_t imageBase, uintptr_t needle, uintptr_t replacement,
                                   uintptr_t *slots, int capacity, bool dryRun, const char *label)
@@ -1230,7 +1231,7 @@ static int hook_scan_tables_value(uintptr_t imageBase, uintptr_t needle, uintptr
         uintptr_t start = (uintptr_t)seg->vmaddr + slide;
         uintptr_t end = start + (uintptr_t)seg->vmsize;
 
-        if (segments < 16) {
+        if (!g_scan_segments_logged && segments < 16) {
             brk_diag_log("scan %s seg %s %p-%p size=%llu initprot=%d",
                          label ? label : "?",
                          seg->segname,
@@ -1354,6 +1355,7 @@ static int hook_pointer_install(uintptr_t target, uintptr_t replacement)
     g_scan_bytes = 0;
     g_scan_values = 0;
     g_scan_matches = 0;
+    g_scan_segments_logged = true;
 
     if (hits <= 0) {
         if (offsetHits > 0) {
@@ -1406,6 +1408,26 @@ int hook_pointer_slots(void)
     }
 
     return total;
+}
+
+int hook_probe(uintptr_t target)
+{
+    if (!target) return -1;
+
+    uintptr_t imageBase = hook_image_base_for(target);
+
+    if (!imageBase) return -1;
+
+    uint64_t before = g_scan_matches;
+    uintptr_t slots[HOOK_PTR_SLOTS];
+
+    hook_scan_tables_value(imageBase, target, 0, slots, HOOK_PTR_SLOTS, true, "probe");
+
+    uint64_t found = g_scan_matches - before;
+
+    if (found > 0x7FFFFFFFULL) found = 0x7FFFFFFFULL;
+
+    return (int)found;
 }
 
 bool brk_install(void *target, void *replacement)
