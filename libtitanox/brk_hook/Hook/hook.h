@@ -20,6 +20,8 @@ const char *hook_last_error(void);
 
 bool hook_sign_check(uintptr_t address);
 
+void hook_log_prot(const char *label, uintptr_t address);
+
 bool hook_verify_encryption(void *image);
 
 bool brk_install(void *target, void *replacement);
