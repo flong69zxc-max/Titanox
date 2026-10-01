@@ -1,144 +1,130 @@
 #include "hook.h"
-#include "mach_excServer.h"
 
 #include <mach/mach.h>
-#include <mach/arm/thread_status.h>
+#include <mach/vm_map.h>
 #include <mach-o/dyld.h>
+#include <mach-o/loader.h>
 #include <dlfcn.h>
 #include <pthread.h>
-#include <sys/sysctl.h>
 #include <stdarg.h>
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+#include <errno.h>
+#include <sys/mman.h>
+#include <libkern/OSCacheControl.h>
 
 #if __has_feature(ptrauth_calls)
 #include <ptrauth.h>
 #endif
 
-#define BRK_MAX 16
-#define BRK_BCR 0x1e5ULL
-#define BRK_VERIFY_MASK 0x1e1ULL
-#define BRK_LOG_LIMIT (1024L * 1024L)
-#define BRK_POLL_US 100000
-#define BRK_PAUSED_MAX 64
+#define HOOK_MAX 64
+#define HOOK_PATCH_SIZE 16
+#define HOOK_TRAMP_SIZE 256
+#define HOOK_LOG_LIMIT (1024L * 1024L)
+#define HOOK_NEAR_RANGE (900LL * 1024LL)
+#define HOOK_BRANCH_RANGE (120LL * 1024LL * 1024LL)
+#define HOOK_VA_LIMIT 0x0000FFFFFFFFFFFFULL
 
-#define BRK_MSG_EXCEPTION_RAISE 2405
-#define BRK_MSG_EXCEPTION_RAISE_STATE_IDENTITY 2407
-#define BRK_CHAIN_TIMEOUT_MS 500
-#define BRK_STATE_WORDS 1296
+#define HOOK_OP_LDR_X16_8 0x58000050u
+#define HOOK_OP_BR_X16 0xD61F0200u
+#define HOOK_OP_BLR_X16 0xD63F0200u
+#define HOOK_OP_NOP 0xD503201Fu
 
 typedef struct {
     uintptr_t target;
+    uintptr_t tramp;
     uintptr_t replacement;
+    uint8_t saved[HOOK_PATCH_SIZE];
+    uint8_t patch[HOOK_PATCH_SIZE];
     uint64_t hits;
+    uint32_t block_bytes;
     bool used;
     bool armed;
-    bool observe;
-} brk_entry_t;
+    bool near;
+} hook_entry_t;
 
-static brk_entry_t g_entries[BRK_MAX];
-static uintptr_t g_owned_target[BRK_MAX];
-static mach_port_t g_paused[BRK_PAUSED_MAX];
-
+static hook_entry_t g_hooks[HOOK_MAX];
 static pthread_mutex_t g_lock = PTHREAD_MUTEX_INITIALIZER;
 static pthread_mutex_t g_log_lock = PTHREAD_MUTEX_INITIALIZER;
-static pthread_once_t g_once = PTHREAD_ONCE_INIT;
-
-static mach_port_t g_port = MACH_PORT_NULL;
-static mach_port_t g_server_thread = MACH_PORT_NULL;
-static mach_port_t g_sweep_thread = MACH_PORT_NULL;
-
-static int g_physical_limit = 6;
-static uint32_t g_live_mask = 0;
-static bool g_ready = false;
-
-static exception_mask_t g_prev_mask = 0;
-static mach_port_t g_prev_port = MACH_PORT_NULL;
-static exception_behavior_t g_prev_behavior = 0;
-static thread_state_flavor_t g_prev_flavor = 0;
-static bool g_prev_valid = false;
-static bool g_chain = false;
-static bool g_livecontainer = false;
-static bool g_task_port_disabled = false;
-static uint64_t g_chain_hits = 0;
-static uint64_t g_chain_fails = 0;
 
 static FILE *g_log = NULL;
 static long g_log_bytes = 0;
-static __thread unsigned g_pause_depth = 0;
-static __thread mach_port_t g_pause_port = MACH_PORT_NULL;
+static uint64_t g_total_hits = 0;
+static uint64_t g_fail_count = 0;
+static uint64_t g_install_count = 0;
+static bool g_ready = false;
+static char g_last_error[256];
 
 static volatile int g_probe_value = 0;
 
-static bool name_marks_host_runtime(const char *name)
-{
-    if (!name) return false;
-
-    static const char *marks[] = {
-        "TweakLoader",
-        "LiveContainer",
-        "LiveContainerShared",
-        "CydiaSubstrate",
-        "libellekit",
-        "SubstrateLoader",
-        NULL
-    };
-
-    for (int i = 0; marks[i]; ++i) {
-        if (strstr(name, marks[i])) return true;
-    }
-
-    return false;
-}
-
-static bool detect_livecontainer(void)
-{
-    uint32_t count = _dyld_image_count();
-
-    if (count > 8192) count = 8192;
-
-    for (uint32_t i = 0; i < count; ++i) {
-        const char *name = _dyld_get_image_name(i);
-        if (name_marks_host_runtime(name)) return true;
-    }
-
-    if (dlsym(RTLD_DEFAULT, "LiveContainerMain") != NULL) return true;
-
-    const char *home = getenv("HOME");
-
-    if (home) {
-        char probe[1024];
-        snprintf(probe, sizeof(probe), "%s/Documents/Tweaks", home);
-        if (access(probe, F_OK) == 0) return true;
-    }
-
-    return false;
-}
-
-static uintptr_t strip_pointer(const void *p)
+static uintptr_t strip_fn(const void *p)
 {
 #if __has_feature(ptrauth_calls)
-    return (uintptr_t)ptrauth_strip(
-        p,
-        ptrauth_key_function_pointer
-    );
+    uintptr_t raw = (uintptr_t)ptrauth_strip(p, ptrauth_key_function_pointer);
 #else
-    return (uintptr_t)p;
+    uintptr_t raw = (uintptr_t)p;
 #endif
+    return raw & HOOK_VA_LIMIT;
 }
 
-static void *sign_pointer(uintptr_t p)
+static void *sign_fn(uintptr_t p)
 {
 #if __has_feature(ptrauth_calls)
-    return ptrauth_sign_unauthenticated(
-        (void *)p,
-        ptrauth_key_function_pointer,
-        0
-    );
+    return ptrauth_sign_unauthenticated((void *)p, ptrauth_key_function_pointer, 0);
 #else
     return (void *)p;
 #endif
+}
+
+static bool hook_region_info(uintptr_t address, vm_prot_t *prot, uintptr_t *start, uintptr_t *end)
+{
+    if (!address) return false;
+
+    vm_address_t region = (vm_address_t)address;
+    vm_size_t size = 0;
+    vm_region_basic_info_data_64_t info;
+    mach_msg_type_number_t count = VM_REGION_BASIC_INFO_COUNT_64;
+    mach_port_t object = MACH_PORT_NULL;
+
+    kern_return_t kr = vm_region_64(
+        mach_task_self(),
+        &region,
+        &size,
+        VM_REGION_BASIC_INFO_64,
+        (vm_region_info_t)&info,
+        &count,
+        &object
+    );
+
+    if (object != MACH_PORT_NULL) {
+        mach_port_deallocate(mach_task_self(), object);
+    }
+
+    if (kr != KERN_SUCCESS || size == 0) return false;
+
+    if (prot) *prot = info.protection;
+    if (start) *start = (uintptr_t)region;
+    if (end) *end = (uintptr_t)region + (uintptr_t)size;
+
+    return true;
+}
+
+bool hook_sign_check(uintptr_t address)
+{
+    if (!address) return false;
+
+    uintptr_t raw = strip_fn((const void *)address);
+    if ((raw & 3) != 0) return false;
+
+    vm_prot_t prot = 0;
+    uintptr_t start = 0;
+    uintptr_t end = 0;
+
+    if (!hook_region_info(raw, &prot, &start, &end)) return false;
+    if (raw < start || raw >= end) return false;
+
+    return (prot & VM_PROT_EXECUTE) ? true : false;
 }
 
 static FILE *open_log_locked(void)
@@ -149,12 +135,7 @@ static FILE *open_log_locked(void)
     char path[1024];
 
     if (home) {
-        snprintf(
-            path,
-            sizeof(path),
-            "%s/Documents/Titanox.log",
-            home
-        );
+        snprintf(path, sizeof(path), "%s/Documents/Titanox.log", home);
     } else {
         snprintf(path, sizeof(path), "/tmp/Titanox.log");
     }
@@ -193,8 +174,8 @@ void brk_diag_log(const char *format, ...)
     FILE *f = open_log_locked();
     size_t size = strlen(buffer);
 
-    if (f && g_log_bytes + (long)size + 7 <= BRK_LOG_LIMIT) {
-        int written = fprintf(f, "[brk] %s\n", buffer);
+    if (f && g_log_bytes + (long)size + 8 <= HOOK_LOG_LIMIT) {
+        int written = fprintf(f, "[hook] %s\n", buffer);
         if (written > 0) g_log_bytes += written;
         fflush(f);
     }
@@ -202,862 +183,780 @@ void brk_diag_log(const char *format, ...)
     pthread_mutex_unlock(&g_log_lock);
 }
 
-static int task_port_status(void)
+void hook_set_error(const char *format, ...)
 {
-    exception_mask_t masks[EXC_TYPES_COUNT];
-    mach_port_t ports[EXC_TYPES_COUNT];
-    exception_behavior_t behaviors[EXC_TYPES_COUNT];
-    thread_state_flavor_t flavors[EXC_TYPES_COUNT];
-    mach_msg_type_number_t count = EXC_TYPES_COUNT;
+    va_list args;
+    va_start(args, format);
+    vsnprintf(g_last_error, sizeof(g_last_error), format, args);
+    va_end(args);
+    brk_diag_log("%s", g_last_error);
+}
 
-    kern_return_t kr = task_get_exception_ports(
+const char *hook_last_error(void)
+{
+    return g_last_error;
+}
+
+static bool hook_read_bytes(uintptr_t address, void *buffer, size_t length)
+{
+    if (!address || !buffer || !length) return false;
+
+    vm_size_t got = 0;
+
+    kern_return_t kr = vm_read_overwrite(
         mach_task_self(),
-        EXC_MASK_BREAKPOINT,
-        masks,
-        &count,
-        ports,
-        behaviors,
-        flavors
+        (vm_address_t)address,
+        (vm_size_t)length,
+        (vm_address_t)buffer,
+        &got
     );
 
-    if (kr != KERN_SUCCESS) return -1;
+    if (kr != KERN_SUCCESS) return false;
 
-    int owned = 0;
-
-    for (mach_msg_type_number_t i = 0; i < count; ++i) {
-        if (ports[i] == g_port &&
-            (masks[i] & EXC_MASK_BREAKPOINT) &&
-            behaviors[i] ==
-                (exception_behavior_t)(EXCEPTION_STATE_IDENTITY | MACH_EXCEPTION_CODES) &&
-            flavors[i] == ARM_THREAD_STATE64) {
-            owned = 1;
-        }
-
-        if (ports[i] != MACH_PORT_NULL) {
-            mach_port_deallocate(mach_task_self(), ports[i]);
-        }
-    }
-
-    return owned;
+    return got == (vm_size_t)length;
 }
 
-static int thread_port_status(mach_port_t thread)
+static bool hook_image_encryption_state(const struct mach_header_64 *header, uint32_t *outCryptid)
 {
-    exception_mask_t masks[EXC_TYPES_COUNT];
-    mach_port_t ports[EXC_TYPES_COUNT];
-    exception_behavior_t behaviors[EXC_TYPES_COUNT];
-    thread_state_flavor_t flavors[EXC_TYPES_COUNT];
-    mach_msg_type_number_t count = EXC_TYPES_COUNT;
+    if (!header) return false;
+    if (header->magic != MH_MAGIC_64) return false;
+    if (header->ncmds == 0 || header->ncmds > 4096) return false;
+    if (header->sizeofcmds == 0 || header->sizeofcmds > (4u * 1024u * 1024u)) return false;
 
-    kern_return_t kr = thread_get_exception_ports(
-        thread,
-        EXC_MASK_BREAKPOINT,
-        masks,
-        &count,
-        ports,
-        behaviors,
-        flavors
-    );
+    const uint8_t *cursor = (const uint8_t *)(header + 1);
+    const uint8_t *limit = cursor + header->sizeofcmds;
 
-    if (kr != KERN_SUCCESS) return -1;
+    for (uint32_t i = 0; i < header->ncmds; i++) {
+        if (cursor + sizeof(struct load_command) > limit) return false;
 
-    int present = 0;
+        const struct load_command *command = (const struct load_command *)cursor;
 
-    for (mach_msg_type_number_t i = 0; i < count; ++i) {
-        if (ports[i] != MACH_PORT_NULL) {
-            present = 1;
-            mach_port_deallocate(mach_task_self(), ports[i]);
+        if (command->cmdsize < sizeof(struct load_command)) return false;
+        if (cursor + command->cmdsize > limit) return false;
+
+        if (command->cmd == LC_ENCRYPTION_INFO_64) {
+            if (command->cmdsize < sizeof(struct encryption_info_command_64)) return false;
+
+            const struct encryption_info_command_64 *info =
+                (const struct encryption_info_command_64 *)command;
+
+            if (outCryptid) *outCryptid = info->cryptid;
+            return true;
         }
-    }
 
-    return present;
-}
-
-static bool is_paused_locked(mach_port_t thread)
-{
-    for (int i = 0; i < BRK_PAUSED_MAX; ++i) {
-        if (g_paused[i] == thread) return true;
+        cursor += command->cmdsize;
     }
 
     return false;
 }
 
-static bool merge_thread_locked(
-    mach_port_t thread,
-    bool allowArming)
+bool hook_verify_encryption(void *image)
 {
-    arm_debug_state64_t current;
-    mach_msg_type_number_t count = ARM_DEBUG_STATE64_COUNT;
-
-    kern_return_t kr = thread_get_state(
-        thread,
-        ARM_DEBUG_STATE64,
-        (thread_state_t)&current,
-        &count
-    );
-
-    if (kr != KERN_SUCCESS || count != ARM_DEBUG_STATE64_COUNT) {
+    if (!image) {
+        hook_set_error("encryption check: null image");
         return false;
     }
 
-    arm_debug_state64_t next = current;
-    bool changed = false;
-    bool ok = true;
+    uint32_t cryptid = 0;
+    bool found = hook_image_encryption_state((const struct mach_header_64 *)image, &cryptid);
 
-    for (int slot = 0; slot < BRK_MAX; ++slot) {
-        if (!g_owned_target[slot]) continue;
-
-        bool desired = allowArming &&
-            g_entries[slot].used &&
-            g_entries[slot].armed;
-
-        bool enabled = (current.__bcr[slot] & 1ULL) != 0;
-        uintptr_t present = (uintptr_t)current.__bvr[slot];
-
-        bool ownValue =
-            present == g_owned_target[slot] ||
-            present == g_entries[slot].target;
-
-        if (desired && enabled && !ownValue) {
-            ok = false;
-            continue;
-        }
-
-        if (desired) {
-            next.__bvr[slot] = g_entries[slot].target;
-            next.__bcr[slot] = BRK_BCR;
-        } else if (ownValue) {
-            next.__bvr[slot] = 0;
-            next.__bcr[slot] = 0;
-        } else {
-            continue;
-        }
-
-        if (next.__bvr[slot] != current.__bvr[slot] ||
-            ((next.__bcr[slot] ^ current.__bcr[slot]) &
-                BRK_VERIFY_MASK)) {
-            changed = true;
-        }
+    if (!found) {
+        brk_diag_log("encryption check: LC_ENCRYPTION_INFO_64 absent, cryptid treated as 0");
+        return true;
     }
 
-    if (!changed) return ok;
+    if (cryptid != 0) {
+        hook_set_error("encryption check: cryptid=%u, aborting before hook install", cryptid);
+        abort();
+    }
 
-    kr = thread_set_state(
-        thread,
-        ARM_DEBUG_STATE64,
-        (thread_state_t)&next,
-        ARM_DEBUG_STATE64_COUNT
+    brk_diag_log("encryption check: cryptid=0");
+    return true;
+}
+
+static bool hook_page_set(uintptr_t address, size_t length, vm_prot_t requested, bool setMaximum, vm_prot_t *previous)
+{
+    if (!address || !length) return false;
+
+    vm_prot_t prot = 0;
+    uintptr_t start = 0;
+    uintptr_t end = 0;
+
+    if (!hook_region_info(address, &prot, &start, &end)) return false;
+    if ((address + length) > end) return false;
+
+    if (previous) *previous = prot;
+
+    kern_return_t kr = vm_protect(
+        mach_task_self(),
+        (vm_address_t)start,
+        (vm_size_t)(end - start),
+        setMaximum ? TRUE : FALSE,
+        requested
     );
 
-    if (kr != KERN_SUCCESS) {
+    return kr == KERN_SUCCESS;
+}
+
+static bool hook_page_writable(uintptr_t address, size_t length, vm_prot_t *saved)
+{
+    vm_prot_t prot = 0;
+    uintptr_t start = 0;
+    uintptr_t end = 0;
+
+    if (!hook_region_info(address, &prot, &start, &end)) return false;
+    if ((address + length) > end) return false;
+
+    if (saved) *saved = prot;
+
+    if (prot & VM_PROT_WRITE) return true;
+
+    vm_prot_t copy = (vm_prot_t)(prot | VM_PROT_COPY | VM_PROT_WRITE | VM_PROT_READ);
+
+    kern_return_t kr = vm_protect(
+        mach_task_self(),
+        (vm_address_t)start,
+        (vm_size_t)(end - start),
+        FALSE,
+        copy
+    );
+
+    if (kr == KERN_SUCCESS) return true;
+
+    brk_diag_log("page VM_PROT_COPY failed kr=%d errno=%d, escalating to RWX", kr, errno);
+
+    hook_page_set(start, 1, (vm_prot_t)(VM_PROT_READ | VM_PROT_WRITE | VM_PROT_EXECUTE), TRUE, NULL);
+
+    kr = vm_protect(
+        mach_task_self(),
+        (vm_address_t)start,
+        (vm_size_t)(end - start),
+        FALSE,
+        (vm_prot_t)(VM_PROT_READ | VM_PROT_WRITE | VM_PROT_EXECUTE)
+    );
+
+    return kr == KERN_SUCCESS;
+}
+
+static bool hook_page_restore(uintptr_t address, vm_prot_t saved)
+{
+    vm_prot_t prot = 0;
+    uintptr_t start = 0;
+    uintptr_t end = 0;
+
+    if (!hook_region_info(address, &prot, &start, &end)) return false;
+
+    vm_prot_t target = (vm_prot_t)(saved & ~VM_PROT_WRITE);
+    if ((saved & VM_PROT_EXECUTE) == 0) target = saved;
+
+    hook_page_set(start, 1, (vm_prot_t)(VM_PROT_READ | VM_PROT_WRITE | VM_PROT_EXECUTE), TRUE, NULL);
+
+    kern_return_t kr = vm_protect(
+        mach_task_self(),
+        (vm_address_t)start,
+        (vm_size_t)(end - start),
+        FALSE,
+        target
+    );
+
+    return kr == KERN_SUCCESS;
+}
+
+static bool hook_write_bytes(uintptr_t address, const void *data, size_t length)
+{
+    if (!address || !data || !length) return false;
+
+    vm_prot_t saved = 0;
+
+    if (!hook_page_writable(address, length, &saved)) {
+        hook_set_error("write: page not writable at %p len=%zu", (void *)address, length);
         return false;
     }
 
-    arm_debug_state64_t readback;
-    count = ARM_DEBUG_STATE64_COUNT;
+    memcpy((void *)address, data, length);
 
-    kr = thread_get_state(
-        thread,
-        ARM_DEBUG_STATE64,
-        (thread_state_t)&readback,
-        &count
-    );
+    sys_icache_invalidate((void *)address, length);
 
-    if (kr != KERN_SUCCESS || count != ARM_DEBUG_STATE64_COUNT) {
-        return false;
-    }
+    hook_page_restore(address, saved);
 
-    for (int slot = 0; slot < BRK_MAX; ++slot) {
-        if (!g_owned_target[slot]) continue;
+    uint8_t verify[HOOK_PATCH_SIZE];
 
-        bool desired = allowArming &&
-            g_entries[slot].used &&
-            g_entries[slot].armed;
+    if (length <= sizeof(verify)) {
+        if (!hook_read_bytes(address, verify, length)) {
+            hook_set_error("write: readback failed at %p", (void *)address);
+            return false;
+        }
 
-        uintptr_t before = (uintptr_t)current.__bvr[slot];
-
-        bool ownValue =
-            before == g_owned_target[slot] ||
-            before == g_entries[slot].target;
-
-        if (!desired && !ownValue) continue;
-
-        uint64_t wantedBVR =
-            desired ? g_entries[slot].target : 0;
-
-        uint64_t wantedBCR =
-            desired ? BRK_BCR & BRK_VERIFY_MASK : 0;
-
-        if (readback.__bvr[slot] != wantedBVR ||
-            (readback.__bcr[slot] & BRK_VERIFY_MASK) != wantedBCR) {
-            ok = false;
+        if (memcmp(verify, data, length) != 0) {
+            hook_set_error("write: readback mismatch at %p", (void *)address);
+            return false;
         }
     }
 
-    return ok;
+    return true;
 }
 
-static bool sync_locked(void)
+static int64_t hook_sign_extend(uint64_t value, int bits)
 {
-    thread_act_array_t threads = NULL;
-    mach_msg_type_number_t count = 0;
-
-    kern_return_t kr = task_threads(
-        mach_task_self(),
-        &threads,
-        &count
-    );
-
-    if (kr != KERN_SUCCESS) return false;
-
-    bool portOwned = task_port_status() == 1;
-    bool ok = portOwned;
-
-    for (mach_msg_type_number_t i = 0; i < count; ++i) {
-        bool service =
-            threads[i] == g_server_thread ||
-            threads[i] == g_sweep_thread;
-
-        int threadPort = service ? 0 : thread_port_status(threads[i]);
-
-        bool allow =
-            portOwned &&
-            !service &&
-            threadPort == 0 &&
-            !is_paused_locked(threads[i]);
-
-        if (!service && threadPort != 0) {
-            ok = false;
-        }
-
-        if (!merge_thread_locked(threads[i], allow)) ok = false;
-
-        mach_port_deallocate(mach_task_self(), threads[i]);
-    }
-
-    vm_deallocate(
-        mach_task_self(),
-        (vm_address_t)threads,
-        count * sizeof(thread_act_t)
-    );
-
-    return ok;
+    uint64_t shift = (uint64_t)(64 - bits);
+    int64_t shifted = (int64_t)(value << shift);
+    return shifted >> shift;
 }
 
-static void *exception_loop(void *arg)
+static void hook_put32(uint8_t *out, int offset, uint32_t word)
 {
-    for (;;) {
-        kern_return_t kr = mach_msg_server(
-            mach_exc_server,
-            sizeof(union __RequestUnion__catch_mach_exc_subsystem),
-            g_port,
-            MACH_MSG_OPTION_NONE
-        );
-
-        if (kr != KERN_SUCCESS) {
-            usleep(10000);
-        }
-    }
-
-    return NULL;
+    memcpy(out + offset, &word, 4);
 }
 
-static void *sweep_loop(void *arg)
+static int hook_emit_movabs(uint8_t *out, uint32_t rd, uint64_t value)
 {
-    for (;;) {
-        usleep(BRK_POLL_US);
-
-        pthread_mutex_lock(&g_lock);
-        sync_locked();
-        pthread_mutex_unlock(&g_lock);
-    }
-
-    return NULL;
+    hook_put32(out, 0, 0xD2800000u | ((uint32_t)(value & 0xFFFFu) << 5) | rd);
+    hook_put32(out, 4, 0xF2800000u | (1u << 21) | ((uint32_t)((value >> 16) & 0xFFFFu) << 5) | rd);
+    hook_put32(out, 8, 0xF2800000u | (2u << 21) | ((uint32_t)((value >> 32) & 0xFFFFu) << 5) | rd);
+    hook_put32(out, 12, 0xF2800000u | (3u << 21) | ((uint32_t)((value >> 48) & 0xFFFFu) << 5) | rd);
+    return 16;
 }
 
-#pragma pack(push, 4)
-
-typedef struct {
-    mach_msg_header_t Head;
-    mach_msg_body_t body;
-    mach_msg_port_descriptor_t thread;
-    mach_msg_port_descriptor_t task;
-    NDR_record_t NDR;
-    exception_type_t exception;
-    mach_msg_type_number_t codeCnt;
-    int64_t code[2];
-    int flavor;
-    mach_msg_type_number_t old_stateCnt;
-    natural_t old_state[ARM_THREAD_STATE64_COUNT];
-} brk_forward_request_t;
-
-typedef struct {
-    mach_msg_header_t Head;
-    NDR_record_t NDR;
-    kern_return_t RetCode;
-    int flavor;
-    mach_msg_type_number_t new_stateCnt;
-    natural_t new_state[BRK_STATE_WORDS];
-} brk_forward_reply_t;
-
-#pragma pack(pop)
-
-static kern_return_t forward_to_previous(
-    mach_port_t thread,
-    mach_port_t task,
-    exception_type_t exception,
-    mach_exception_data_t code,
-    mach_msg_type_number_t codeCnt,
-    thread_state_t old_state,
-    mach_msg_type_number_t old_stateCnt,
-    thread_state_t new_state,
-    mach_msg_type_number_t *new_stateCnt)
+static int hook_emit_abs_jump(uint8_t *out, uintptr_t target, bool link)
 {
-    if (!g_prev_valid || g_prev_port == MACH_PORT_NULL) return KERN_FAILURE;
-    if (!g_chain) return KERN_FAILURE;
-    if ((g_prev_behavior & ~MACH_EXCEPTION_CODES) != EXCEPTION_STATE_IDENTITY) {
-        return KERN_FAILURE;
-    }
-    if (g_prev_flavor != ARM_THREAD_STATE64) return KERN_FAILURE;
-    if (!old_state || old_stateCnt != ARM_THREAD_STATE64_COUNT) return KERN_FAILURE;
-    if (!new_state || !new_stateCnt) return KERN_FAILURE;
-    if (*new_stateCnt < ARM_THREAD_STATE64_COUNT) return KERN_FAILURE;
-
-    mach_port_t reply = MACH_PORT_NULL;
-
-    kern_return_t kr = mach_port_allocate(
-        mach_task_self(),
-        MACH_PORT_RIGHT_RECEIVE,
-        &reply
-    );
-
-    if (kr != KERN_SUCCESS) return KERN_FAILURE;
-
-    brk_forward_request_t *request = calloc(1, sizeof(brk_forward_request_t));
-    brk_forward_reply_t *reply_buffer = calloc(1, sizeof(brk_forward_reply_t));
-
-    kern_return_t result = KERN_FAILURE;
-
-    if (request && reply_buffer) {
-        request->Head.msgh_bits =
-            MACH_MSGH_BITS(MACH_MSG_TYPE_COPY_SEND, MACH_MSG_TYPE_MAKE_SEND_ONCE) |
-            MACH_MSGH_BITS_COMPLEX;
-        request->Head.msgh_size = (mach_msg_size_t)sizeof(brk_forward_request_t);
-        request->Head.msgh_remote_port = g_prev_port;
-        request->Head.msgh_local_port = reply;
-        request->Head.msgh_id = BRK_MSG_EXCEPTION_RAISE_STATE_IDENTITY;
-
-        request->body.msgh_descriptor_count = 2;
-
-        request->thread.name = thread;
-        request->thread.type = MACH_MSG_PORT_DESCRIPTOR;
-        request->thread.disposition = MACH_MSG_TYPE_COPY_SEND;
-
-        request->task.name = task;
-        request->task.type = MACH_MSG_PORT_DESCRIPTOR;
-        request->task.disposition = MACH_MSG_TYPE_COPY_SEND;
-
-        request->NDR = NDR_record;
-        request->exception = exception;
-        request->codeCnt = codeCnt > 2 ? 2 : codeCnt;
-
-        for (mach_msg_type_number_t i = 0; i < request->codeCnt; ++i) {
-            request->code[i] = code[i];
-        }
-
-        request->flavor = ARM_THREAD_STATE64;
-        request->old_stateCnt = ARM_THREAD_STATE64_COUNT;
-
-        memcpy(
-            request->old_state,
-            old_state,
-            sizeof(natural_t) * ARM_THREAD_STATE64_COUNT
-        );
-
-        mach_msg_return_t mr = mach_msg(
-            &request->Head,
-            MACH_SEND_MSG | MACH_SEND_TIMEOUT,
-            request->Head.msgh_size,
-            0,
-            MACH_PORT_NULL,
-            BRK_CHAIN_TIMEOUT_MS,
-            MACH_PORT_NULL
-        );
-
-        if (mr == MACH_MSG_SUCCESS) {
-            mr = mach_msg(
-                &reply_buffer->Head,
-                MACH_RCV_MSG | MACH_RCV_TIMEOUT,
-                0,
-                (mach_msg_size_t)sizeof(brk_forward_reply_t),
-                reply,
-                BRK_CHAIN_TIMEOUT_MS,
-                MACH_PORT_NULL
-            );
-
-            if (mr == MACH_MSG_SUCCESS &&
-                reply_buffer->RetCode == KERN_SUCCESS) {
-                if (reply_buffer->flavor == ARM_THREAD_STATE64 &&
-                    reply_buffer->new_stateCnt == ARM_THREAD_STATE64_COUNT) {
-                    memcpy(
-                        new_state,
-                        reply_buffer->new_state,
-                        sizeof(natural_t) * ARM_THREAD_STATE64_COUNT
-                    );
-
-                    *new_stateCnt = reply_buffer->new_stateCnt;
-                }
-
-                result = KERN_SUCCESS;
-            }
-        }
-    }
-
-    free(request);
-    free(reply_buffer);
-
-    mach_port_mod_refs(
-        mach_task_self(),
-        reply,
-        MACH_PORT_RIGHT_RECEIVE,
-        -1
-    );
-
-    return result;
+    hook_put32(out, 0, HOOK_OP_LDR_X16_8);
+    hook_put32(out, 4, link ? HOOK_OP_BLR_X16 : HOOK_OP_BR_X16);
+    hook_put32(out, 8, (uint32_t)(target & 0xFFFFFFFFu));
+    hook_put32(out, 12, (uint32_t)((target >> 32) & 0xFFFFFFFFu));
+    return 16;
 }
 
-static bool same_port_group(
-    exception_mask_t mask,
-    exception_behavior_t behavior,
-    thread_state_flavor_t flavor)
+static uint32_t hook_invert_condition(uint32_t insn)
 {
-    return (mask & EXC_MASK_BREAKPOINT) &&
-        behavior == (exception_behavior_t)(EXCEPTION_STATE_IDENTITY | MACH_EXCEPTION_CODES) &&
-        flavor == ARM_THREAD_STATE64;
+    if ((insn & 0xFF000010u) == 0x54000000u) return insn ^ 1u;
+    if ((insn & 0x7E000000u) == 0x34000000u) return insn ^ 0x01000000u;
+    if ((insn & 0x7E000000u) == 0x36000000u) return insn ^ 0x01000000u;
+    return insn;
 }
 
-static void init_once(void)
+static int hook_emit_abs_cond(uint8_t *out, uint32_t insn, uintptr_t target)
 {
-    int limit = 0;
-    size_t size = sizeof(limit);
+    uint32_t inverted = hook_invert_condition(insn);
 
-    if (sysctlbyname(
-            "hw.optional.breakpoint",
-            &limit,
-            &size,
-            NULL,
-            0) == 0 && limit > 0) {
-        g_physical_limit = limit;
-    }
-
-    if (g_physical_limit > BRK_MAX) g_physical_limit = BRK_MAX;
-    if (g_physical_limit < 1) g_physical_limit = 1;
-
-    g_livecontainer = detect_livecontainer();
-
-    const char *optout = getenv("TITANOX_NO_TASK_EXC_PORT");
-
-    if (optout && optout[0] == '1') g_task_port_disabled = true;
-
-    exception_mask_t masks[EXC_TYPES_COUNT];
-    mach_port_t ports[EXC_TYPES_COUNT];
-    exception_behavior_t behaviors[EXC_TYPES_COUNT];
-    thread_state_flavor_t flavors[EXC_TYPES_COUNT];
-    mach_msg_type_number_t count = EXC_TYPES_COUNT;
-
-    kern_return_t kr = task_get_exception_ports(
-        mach_task_self(),
-        EXC_MASK_BREAKPOINT,
-        masks,
-        &count,
-        ports,
-        behaviors,
-        flavors
-    );
-
-    if (kr != KERN_SUCCESS) {
-        brk_diag_log("initial_exception_query_failed kr=%d", kr);
-        return;
-    }
-
-    for (mach_msg_type_number_t i = 0; i < count; ++i) {
-        if (ports[i] == MACH_PORT_NULL) continue;
-
-        brk_diag_log(
-            "existing_task_exception_port port=%u behavior=%d flavor=%d mask=0x%x",
-            ports[i],
-            behaviors[i],
-            flavors[i],
-            masks[i]
-        );
-
-        if (!g_prev_valid) {
-            g_prev_mask = masks[i];
-            g_prev_port = ports[i];
-            g_prev_behavior = behaviors[i];
-            g_prev_flavor = flavors[i];
-            g_prev_valid = true;
-            continue;
-        }
-
-        mach_port_deallocate(mach_task_self(), ports[i]);
-    }
-
-    if (g_prev_valid) {
-        g_chain = same_port_group(
-            g_prev_mask,
-            g_prev_behavior,
-            g_prev_flavor
-        );
-    }
-
-    brk_diag_log(
-        "host_state livecontainer=%d previous_port=%u previous_behavior=%d chained=%d",
-        g_livecontainer ? 1 : 0,
-        (unsigned)g_prev_port,
-        g_prev_behavior,
-        g_chain ? 1 : 0
-    );
-
-    if (g_task_port_disabled) {
-        brk_diag_log("task_exception_port_disabled_by_env");
-        return;
-    }
-
-    if (g_livecontainer && g_prev_valid && !g_chain) {
-        brk_diag_log("task_exception_port_refused_foreign_owner");
-        return;
-    }
-
-    kr = mach_port_allocate(
-        mach_task_self(),
-        MACH_PORT_RIGHT_RECEIVE,
-        &g_port
-    );
-
-    if (kr != KERN_SUCCESS) return;
-
-    kr = mach_port_insert_right(
-        mach_task_self(),
-        g_port,
-        g_port,
-        MACH_MSG_TYPE_MAKE_SEND
-    );
-
-    if (kr != KERN_SUCCESS) {
-        mach_port_deallocate(mach_task_self(), g_port);
-        g_port = MACH_PORT_NULL;
-        return;
-    }
-
-    pthread_t server;
-
-    if (pthread_create(&server, NULL, exception_loop, NULL) != 0) {
-        mach_port_deallocate(mach_task_self(), g_port);
-        g_port = MACH_PORT_NULL;
-        return;
-    }
-
-    g_server_thread = pthread_mach_thread_np(server);
-    pthread_detach(server);
-
-    kr = task_set_exception_ports(
-        mach_task_self(),
-        EXC_MASK_BREAKPOINT,
-        g_port,
-        EXCEPTION_STATE_IDENTITY | MACH_EXCEPTION_CODES,
-        ARM_THREAD_STATE64
-    );
-
-    if (kr != KERN_SUCCESS) {
-        brk_diag_log("set_exception_ports_failed kr=%d", kr);
-        return;
-    }
-
-    g_live_mask = (1U << g_physical_limit) - 1U;
-    g_ready = true;
-
-    pthread_t sweep;
-
-    if (pthread_create(&sweep, NULL, sweep_loop, NULL) == 0) {
-        pthread_mutex_lock(&g_lock);
-        g_sweep_thread = pthread_mach_thread_np(sweep);
-        pthread_mutex_unlock(&g_lock);
-        pthread_detach(sweep);
-    }
-
-    brk_diag_log(
-        "init physical_limit=%d behavior=state_identity poll_us=%d",
-        g_physical_limit,
-        BRK_POLL_US
-    );
-}
-
-static bool initialize(void)
-{
-    pthread_once(&g_once, init_once);
-    return g_ready;
-}
-
-static bool register_slot(
-    int requestedSlot,
-    void *target,
-    void *replacement,
-    bool observe)
-{
-    if (!target || (!observe && !replacement)) return false;
-    if (!initialize()) return false;
-
-    uintptr_t t = strip_pointer(target);
-    uintptr_t r = observe ? 0 : strip_pointer(replacement);
-
-    if (!t || (t & 3U) || (!observe && (!r || (r & 3U)))) {
-        return false;
-    }
-
-    pthread_mutex_lock(&g_lock);
-
-    int slot = -1;
-
-    for (int i = 0; i < BRK_MAX; ++i) {
-        if (g_entries[i].used && g_entries[i].target == t) {
-            slot = i;
-            break;
-        }
-    }
-
-    if (slot < 0 && requestedSlot >= 0) {
-        if (requestedSlot < g_physical_limit &&
-            !g_entries[requestedSlot].used) {
-            slot = requestedSlot;
-        }
-    }
-
-    if (slot < 0 && requestedSlot < 0) {
-        for (int i = 0; i < g_physical_limit; ++i) {
-            if ((g_live_mask & (1U << i)) && !g_entries[i].used) {
-                slot = i;
-                break;
-            }
-        }
-    }
-
-    if (slot < 0 ||
-        (requestedSlot >= 0 && slot != requestedSlot)) {
-        pthread_mutex_unlock(&g_lock);
-        brk_diag_log("install_rejected target=%p", (void *)t);
-        return false;
-    }
-
-    brk_entry_t previous = g_entries[slot];
-    uintptr_t previousOwned = g_owned_target[slot];
-
-    if (previousOwned && previousOwned != t) {
-        g_entries[slot].armed = false;
-        sync_locked();
-    }
-
-    g_entries[slot] = (brk_entry_t){
-        .target = t,
-        .replacement = r,
-        .hits = 0,
-        .used = true,
-        .armed = true,
-        .observe = observe
-    };
-
-    g_owned_target[slot] = t;
-
-    bool ok = sync_locked();
-
-    if (!ok) {
-        g_entries[slot].armed = false;
-        sync_locked();
-        g_entries[slot] = previous;
-        g_owned_target[slot] = previousOwned;
-        sync_locked();
-    }
-
-    pthread_mutex_unlock(&g_lock);
-
-    brk_diag_log(
-        "install target=%p slot=%d mode=%s verified=%d",
-        (void *)t,
-        slot,
-        observe ? "first_hit" : "replacement",
-        ok
-    );
-
-    return ok;
-}
-
-kern_return_t catch_mach_exception_raise(
-    mach_port_t exception_port,
-    mach_port_t thread,
-    mach_port_t task,
-    exception_type_t exception,
-    mach_exception_data_t code,
-    mach_msg_type_number_t codeCnt)
-{
-    mach_port_deallocate(mach_task_self(), thread);
-    mach_port_deallocate(mach_task_self(), task);
-    return KERN_FAILURE;
-}
-
-kern_return_t catch_mach_exception_raise_state(
-    mach_port_t exception_port,
-    exception_type_t exception,
-    const mach_exception_data_t code,
-    mach_msg_type_number_t codeCnt,
-    int *flavor,
-    const thread_state_t old_state,
-    mach_msg_type_number_t old_stateCnt,
-    thread_state_t new_state,
-    mach_msg_type_number_t *new_stateCnt)
-{
-    return KERN_FAILURE;
-}
-
-kern_return_t catch_mach_exception_raise_state_identity(
-    mach_port_t exception_port,
-    mach_port_t thread,
-    mach_port_t task,
-    exception_type_t exception,
-    mach_exception_data_t code,
-    mach_msg_type_number_t codeCnt,
-    int *flavor,
-    thread_state_t old_state,
-    mach_msg_type_number_t old_stateCnt,
-    thread_state_t new_state,
-    mach_msg_type_number_t *new_stateCnt)
-{
-    kern_return_t result = KERN_FAILURE;
-    int matched = -1;
-    bool forward = false;
-
-    if (exception != EXC_BREAKPOINT ||
-        *flavor != ARM_THREAD_STATE64 ||
-        old_stateCnt != ARM_THREAD_STATE64_COUNT ||
-        *new_stateCnt < ARM_THREAD_STATE64_COUNT) {
-        goto finish;
-    }
-
-    arm_thread_state64_t old;
-    memcpy(&old, old_state, sizeof(old));
-    uintptr_t pc = (uintptr_t)arm_thread_state64_get_pc(old);
-
-    pthread_mutex_lock(&g_lock);
-
-    for (int i = 0; i < BRK_MAX; ++i) {
-        if (g_entries[i].used && g_entries[i].target == pc) {
-            matched = i;
-            break;
-        }
-    }
-
-    if (matched >= 0) {
-        brk_entry_t *entry = &g_entries[matched];
-        arm_thread_state64_t next = old;
-
-        entry->hits++;
-
-        if (entry->observe) {
-            entry->armed = false;
-            sync_locked();
-
-            if (merge_thread_locked(thread, false)) {
-                memcpy(new_state, &next, sizeof(next));
-                *new_stateCnt = ARM_THREAD_STATE64_COUNT;
-                result = KERN_SUCCESS;
-            }
-        } else if (entry->armed) {
-            arm_thread_state64_set_pc_fptr(
-                next,
-                sign_pointer(entry->replacement)
-            );
-
-            memcpy(new_state, &next, sizeof(next));
-            *new_stateCnt = ARM_THREAD_STATE64_COUNT;
-            result = KERN_SUCCESS;
-        }
+    if ((insn & 0x7E000000u) == 0x36000000u) {
+        inverted = (inverted & 0xFFF8001Fu) | (5u << 5);
     } else {
-        forward = g_chain && g_prev_valid;
+        inverted = (inverted & 0xFF00001Fu) | (5u << 5);
     }
 
-    pthread_mutex_unlock(&g_lock);
+    hook_put32(out, 0, inverted);
+    hook_emit_abs_jump(out + 4, target, false);
+    hook_put32(out, 20, HOOK_OP_NOP);
 
-    if (forward) {
-        kern_return_t kr = forward_to_previous(
-            thread,
-            task,
-            exception,
-            code,
-            codeCnt,
-            old_state,
-            old_stateCnt,
-            new_state,
-            new_stateCnt
-        );
+    return 24;
+}
 
-        if (kr == KERN_SUCCESS) {
-            __sync_fetch_and_add(&g_chain_hits, 1);
-            result = KERN_SUCCESS;
-        } else {
-            __sync_fetch_and_add(&g_chain_fails, 1);
+static int hook_emit_abs_literal_load(uint8_t *out, uint32_t insn, uintptr_t target)
+{
+    uint32_t opc = (insn >> 30) & 3u;
+    uint32_t rt = insn & 0x1Fu;
+
+    hook_put32(out, 0, 0x18000000u | (opc << 30) | (2u << 5) | rt);
+    hook_put32(out, 4, 0x14000000u | 4u);
+    hook_put32(out, 8, (uint32_t)(target & 0xFFFFFFFFu));
+    hook_put32(out, 12, (uint32_t)((target >> 32) & 0xFFFFFFFFu));
+
+    return 16;
+}
+
+static bool hook_reloc_adrp(uint32_t insn, uintptr_t src, uintptr_t dst, uint32_t *out)
+{
+    int64_t immlo = (int64_t)((insn >> 29) & 3u);
+    int64_t immhi = (int64_t)((insn >> 5) & 0x7FFFFu);
+    int64_t imm = hook_sign_extend((uint64_t)((immhi << 2) | immlo), 21);
+
+    int64_t srcPage = (int64_t)(src & ~0xFFFULL);
+    int64_t dstPage = (int64_t)(dst & ~0xFFFULL);
+    int64_t delta = (srcPage + (imm << 12)) - dstPage;
+
+    if ((delta & 0xFFF) != 0) return false;
+
+    int64_t pages = delta >> 12;
+    if (pages < -(1LL << 20) || pages >= (1LL << 20)) return false;
+
+    uint32_t lo = (uint32_t)(pages & 3);
+    uint32_t hi = (uint32_t)((pages >> 2) & 0x7FFFF);
+
+    *out = (insn & 0x9F00001Fu) | (lo << 29) | (hi << 5);
+    return true;
+}
+
+static bool hook_reloc_adr(uint32_t insn, uintptr_t src, uintptr_t dst, uint32_t *out)
+{
+    int64_t immlo = (int64_t)((insn >> 29) & 3u);
+    int64_t immhi = (int64_t)((insn >> 5) & 0x7FFFFu);
+    int64_t imm = hook_sign_extend((uint64_t)((immhi << 2) | immlo), 21);
+
+    int64_t delta = ((int64_t)src + imm) - (int64_t)dst;
+
+    if (delta < -(1LL << 20) || delta >= (1LL << 20)) return false;
+
+    uint32_t lo = (uint32_t)(delta & 3);
+    uint32_t hi = (uint32_t)((delta >> 2) & 0x7FFFF);
+
+    *out = (insn & 0x9F00001Fu) | (lo << 29) | (hi << 5);
+    return true;
+}
+
+static bool hook_reloc_branch26(uint32_t insn, uintptr_t src, uintptr_t dst, uint32_t *out)
+{
+    int64_t imm = hook_sign_extend(insn & 0x03FFFFFFu, 26);
+    int64_t delta = ((int64_t)src + (imm << 2)) - (int64_t)dst;
+
+    if ((delta & 3) != 0) return false;
+    if (delta < -HOOK_BRANCH_RANGE || delta > HOOK_BRANCH_RANGE) return false;
+
+    int64_t words = delta >> 2;
+    if (words < -(1LL << 25) || words >= (1LL << 25)) return false;
+
+    *out = (insn & 0xFC000000u) | (uint32_t)(words & 0x03FFFFFFu);
+    return true;
+}
+
+static bool hook_reloc_branch19(uint32_t insn, uintptr_t src, uintptr_t dst, uint32_t *out)
+{
+    int64_t imm = hook_sign_extend((insn >> 5) & 0x7FFFFu, 19);
+    int64_t delta = ((int64_t)src + (imm << 2)) - (int64_t)dst;
+
+    if ((delta & 3) != 0) return false;
+    if (delta < -(1LL << 20) || delta >= (1LL << 20)) return false;
+
+    int64_t words = delta >> 2;
+    *out = (insn & 0xFF00001Fu) | ((uint32_t)(words & 0x7FFFFu) << 5);
+    return true;
+}
+
+static bool hook_reloc_branch14(uint32_t insn, uintptr_t src, uintptr_t dst, uint32_t *out)
+{
+    int64_t imm = hook_sign_extend((insn >> 5) & 0x3FFFu, 14);
+    int64_t delta = ((int64_t)src + (imm << 2)) - (int64_t)dst;
+
+    if ((delta & 3) != 0) return false;
+    if (delta < -(1LL << 15) || delta >= (1LL << 15)) return false;
+
+    int64_t words = delta >> 2;
+    *out = (insn & 0xFFF8001Fu) | ((uint32_t)(words & 0x3FFFu) << 5);
+    return true;
+}
+
+static int hook_emit_one(uint32_t insn, uintptr_t src, uintptr_t dst, uint8_t *out)
+{
+    uint32_t word = insn;
+    int64_t imm19 = 0;
+    int64_t imm14 = 0;
+    int64_t imm26 = 0;
+
+    if ((insn & 0x9F000000u) == 0x90000000u) {
+        if (hook_reloc_adrp(insn, src, dst, &word)) {
+            hook_put32(out, 0, word);
+            hook_put32(out, 4, HOOK_OP_NOP);
+            return 8;
+        }
+
+        int64_t immlo = (int64_t)((insn >> 29) & 3u);
+        int64_t immhi = (int64_t)((insn >> 5) & 0x7FFFFu);
+        int64_t imm = hook_sign_extend((uint64_t)((immhi << 2) | immlo), 21);
+        uint64_t page = (uint64_t)((int64_t)(src & ~0xFFFULL) + (imm << 12));
+
+        return hook_emit_movabs(out, (uint32_t)(insn & 0x1Fu), page);
+    }
+
+    if ((insn & 0x9F000000u) == 0x10000000u) {
+        if (hook_reloc_adr(insn, src, dst, &word)) {
+            hook_put32(out, 0, word);
+            hook_put32(out, 4, HOOK_OP_NOP);
+            return 8;
+        }
+
+        int64_t immlo = (int64_t)((insn >> 29) & 3u);
+        int64_t immhi = (int64_t)((insn >> 5) & 0x7FFFFu);
+        int64_t imm = hook_sign_extend((uint64_t)((immhi << 2) | immlo), 21);
+
+        return hook_emit_movabs(out, (uint32_t)(insn & 0x1Fu), (uint64_t)((int64_t)src + imm));
+    }
+
+    if ((insn & 0x7C000000u) == 0x14000000u) {
+        if (hook_reloc_branch26(insn, src, dst, &word)) {
+            hook_put32(out, 0, word);
+            hook_put32(out, 4, HOOK_OP_NOP);
+            return 8;
+        }
+
+        imm26 = hook_sign_extend(insn & 0x03FFFFFFu, 26);
+        return hook_emit_abs_jump(out, (uintptr_t)((int64_t)src + (imm26 << 2)), false);
+    }
+
+    if ((insn & 0x7C000000u) == 0x94000000u) {
+        if (hook_reloc_branch26(insn, src, dst, &word)) {
+            hook_put32(out, 0, word);
+            hook_put32(out, 4, HOOK_OP_NOP);
+            return 8;
+        }
+
+        imm26 = hook_sign_extend(insn & 0x03FFFFFFu, 26);
+        return hook_emit_abs_jump(out, (uintptr_t)((int64_t)src + (imm26 << 2)), true);
+    }
+
+    if ((insn & 0xFF000010u) == 0x54000000u) {
+        if (hook_reloc_branch19(insn, src, dst, &word)) {
+            hook_put32(out, 0, word);
+            hook_put32(out, 4, HOOK_OP_NOP);
+            return 8;
+        }
+
+        imm19 = hook_sign_extend((insn >> 5) & 0x7FFFFu, 19);
+        return hook_emit_abs_cond(out, insn, (uintptr_t)((int64_t)src + (imm19 << 2)));
+    }
+
+    if ((insn & 0x7E000000u) == 0x34000000u) {
+        if (hook_reloc_branch19(insn, src, dst, &word)) {
+            hook_put32(out, 0, word);
+            hook_put32(out, 4, HOOK_OP_NOP);
+            return 8;
+        }
+
+        imm19 = hook_sign_extend((insn >> 5) & 0x7FFFFu, 19);
+        return hook_emit_abs_cond(out, insn, (uintptr_t)((int64_t)src + (imm19 << 2)));
+    }
+
+    if ((insn & 0x7E000000u) == 0x36000000u) {
+        if (hook_reloc_branch14(insn, src, dst, &word)) {
+            hook_put32(out, 0, word);
+            hook_put32(out, 4, HOOK_OP_NOP);
+            return 8;
+        }
+
+        imm14 = hook_sign_extend((insn >> 5) & 0x3FFFu, 14);
+        return hook_emit_abs_cond(out, insn, (uintptr_t)((int64_t)src + (imm14 << 2)));
+    }
+
+    if ((insn & 0x3B000000u) == 0x18000000u) {
+        if (hook_reloc_branch19(insn, src, dst, &word)) {
+            hook_put32(out, 0, word);
+            hook_put32(out, 4, HOOK_OP_NOP);
+            return 8;
+        }
+
+        imm19 = hook_sign_extend((insn >> 5) & 0x7FFFFu, 19);
+        return hook_emit_abs_literal_load(out, insn, (uintptr_t)((int64_t)src + (imm19 << 2)));
+    }
+
+    hook_put32(out, 0, insn);
+    hook_put32(out, 4, HOOK_OP_NOP);
+    return 8;
+}
+
+static int hook_emit_block(uintptr_t src, uintptr_t dst, const uint32_t *in, uint8_t *out, int capacity)
+{
+    int offset = 0;
+
+    for (int i = 0; i < 4; i++) {
+        if (offset + 24 > capacity) return -1;
+
+        int written = hook_emit_one(in[i],
+                                    src + (uintptr_t)(4 * i),
+                                    dst + (uintptr_t)offset,
+                                    out + offset);
+
+        if (written <= 0) return -1;
+        if (offset + written > capacity) return -1;
+
+        offset += written;
+    }
+
+    return offset;
+}
+
+static uintptr_t hook_alloc_trampoline(uintptr_t target, size_t size, bool *near)
+{
+    if (near) *near = false;
+
+    void *mapped = mmap(NULL, size, PROT_READ | PROT_WRITE | PROT_EXEC,
+                        MAP_PRIVATE | MAP_ANON, -1, 0);
+
+    if (mapped != MAP_FAILED) {
+        int64_t delta = (int64_t)(uintptr_t)mapped - (int64_t)target;
+        if (delta < 0) delta = -delta;
+        if (near) *near = (delta <= HOOK_NEAR_RANGE);
+
+        brk_diag_log("trampoline mmap ptr=%p delta=%lld",
+                     mapped, (long long)((int64_t)(uintptr_t)mapped - (int64_t)target));
+
+        return (uintptr_t)mapped;
+    }
+
+    brk_diag_log("trampoline mmap failed errno=%d, fixed sweep", errno);
+
+    uintptr_t page = target & ~0xFFFULL;
+
+    for (int64_t step = 0x10000; step <= (int64_t)HOOK_NEAR_RANGE; step += 0x10000) {
+        for (int dir = 0; dir < 2; dir++) {
+            mach_vm_address_t candidate =
+                dir ? (mach_vm_address_t)(page + (uintptr_t)step)
+                    : (mach_vm_address_t)(page - (uintptr_t)step);
+
+            if (candidate < 0x100000000ULL) continue;
+
+            kern_return_t kr = mach_vm_allocate(mach_task_self(), &candidate, size, 0);
+            if (kr != KERN_SUCCESS) continue;
+
+            vm_protect(mach_task_self(), candidate, size, FALSE,
+                       VM_PROT_READ | VM_PROT_WRITE | VM_PROT_EXECUTE);
+
+            if (near) *near = true;
+            brk_diag_log("trampoline fixed alloc tramp=%p", (void *)candidate);
+            return (uintptr_t)candidate;
         }
     }
 
-finish:
-    mach_port_deallocate(mach_task_self(), thread);
-    mach_port_deallocate(mach_task_self(), task);
+    size_t bigger = size * 4;
 
-    return result;
+    mapped = mmap(NULL, bigger, PROT_READ | PROT_WRITE | PROT_EXEC,
+                  MAP_PRIVATE | MAP_ANON, -1, 0);
+
+    if (mapped == MAP_FAILED) {
+        hook_set_error("trampoline: mmap failed errno=%d size=%zu", errno, bigger);
+        return 0;
+    }
+
+    brk_diag_log("trampoline retry mmap ptr=%p size=%zu", mapped, bigger);
+    return (uintptr_t)mapped;
+}
+
+static hook_entry_t *hook_find_locked(uintptr_t target)
+{
+    for (int i = 0; i < HOOK_MAX; i++) {
+        if (g_hooks[i].used && g_hooks[i].target == target) return &g_hooks[i];
+    }
+
+    return NULL;
+}
+
+static hook_entry_t *hook_claim_locked(uintptr_t target)
+{
+    for (int i = 0; i < HOOK_MAX; i++) {
+        if (!g_hooks[i].used) {
+            memset(&g_hooks[i], 0, sizeof(hook_entry_t));
+            g_hooks[i].used = true;
+            g_hooks[i].target = target;
+            return &g_hooks[i];
+        }
+    }
+
+    return NULL;
+}
+
+static void hook_build_patch(uintptr_t replacement, uint8_t *out)
+{
+    hook_put32(out, 0, HOOK_OP_LDR_X16_8);
+    hook_put32(out, 4, HOOK_OP_BR_X16);
+    hook_put32(out, 8, (uint32_t)(replacement & 0xFFFFFFFFu));
+    hook_put32(out, 12, (uint32_t)((replacement >> 32) & 0xFFFFFFFFu));
 }
 
 bool brk_install(void *target, void *replacement)
 {
-    return register_slot(-1, target, replacement, false);
+    if (!target || !replacement) {
+        hook_set_error("install: null argument target=%p replacement=%p", target, replacement);
+        return false;
+    }
+
+    uintptr_t addr = strip_fn(target);
+    uintptr_t repl = strip_fn(replacement);
+
+    vm_prot_t prot = 0;
+    uintptr_t regionStart = 0;
+    uintptr_t regionEnd = 0;
+
+    if (!hook_region_info(addr, &prot, &regionStart, &regionEnd)) {
+        hook_set_error("install: target %p not mapped", (void *)addr);
+        return false;
+    }
+
+    if ((addr & 3) != 0) {
+        hook_set_error("install: target %p misaligned", (void *)addr);
+        return false;
+    }
+
+    if ((addr + HOOK_PATCH_SIZE) > regionEnd) {
+        hook_set_error("install: target %p too close to region end", (void *)addr);
+        return false;
+    }
+
+    if ((prot & VM_PROT_EXECUTE) == 0) {
+        hook_set_error("install: target %p not executable (prot=%d)", (void *)addr, (int)prot);
+        return false;
+    }
+
+    if (!hook_sign_check(repl)) {
+        hook_set_error("install: replacement %p failed signature check", (void *)repl);
+        return false;
+    }
+
+    pthread_mutex_lock(&g_lock);
+
+    hook_entry_t *entry = hook_find_locked(addr);
+
+    if (entry && entry->armed) {
+        entry->replacement = repl;
+        hook_build_patch(repl, entry->patch);
+
+        bool updated = hook_write_bytes(entry->target, entry->patch, HOOK_PATCH_SIZE);
+        pthread_mutex_unlock(&g_lock);
+
+        brk_diag_log("install update target=%p replacement=%p status=%d",
+                     (void *)addr, (void *)repl, updated ? 1 : 0);
+
+        return updated;
+    }
+
+    if (!entry) entry = hook_claim_locked(addr);
+
+    if (!entry) {
+        pthread_mutex_unlock(&g_lock);
+        hook_set_error("install: hook table exhausted (%d)", HOOK_MAX);
+        return false;
+    }
+
+    uint32_t original[4];
+
+    if (!hook_read_bytes(addr, original, HOOK_PATCH_SIZE)) {
+        entry->used = false;
+        pthread_mutex_unlock(&g_lock);
+        hook_set_error("install: cannot read 16 bytes at %p", (void *)addr);
+        return false;
+    }
+
+    memcpy(entry->saved, original, HOOK_PATCH_SIZE);
+
+    if (original[0] == HOOK_OP_LDR_X16_8 && original[1] == HOOK_OP_BR_X16) {
+        entry->used = false;
+        pthread_mutex_unlock(&g_lock);
+        hook_set_error("install: %p already carries an inline patch", (void *)addr);
+        return false;
+    }
+
+    bool near = false;
+    uintptr_t tramp = hook_alloc_trampoline(addr, HOOK_TRAMP_SIZE, &near);
+
+    if (!tramp) {
+        entry->used = false;
+        pthread_mutex_unlock(&g_lock);
+        return false;
+    }
+
+    uint8_t trampoline[HOOK_TRAMP_SIZE];
+    memset(trampoline, 0, sizeof(trampoline));
+
+    int blockSize = hook_emit_block(addr, tramp, original, trampoline,
+                                    HOOK_TRAMP_SIZE - HOOK_PATCH_SIZE);
+
+    if (blockSize <= 0) {
+        mach_vm_deallocate(mach_task_self(), (mach_vm_address_t)tramp, HOOK_TRAMP_SIZE);
+        entry->used = false;
+        pthread_mutex_unlock(&g_lock);
+        hook_set_error("install: trampoline emission failed at %p", (void *)addr);
+        return false;
+    }
+
+    uintptr_t resume = addr + HOOK_PATCH_SIZE;
+
+    hook_put32(trampoline, blockSize + 0, HOOK_OP_LDR_X16_8);
+    hook_put32(trampoline, blockSize + 4, HOOK_OP_BR_X16);
+    hook_put32(trampoline, blockSize + 8, (uint32_t)(resume & 0xFFFFFFFFu));
+    hook_put32(trampoline, blockSize + 12, (uint32_t)((resume >> 32) & 0xFFFFFFFFu));
+
+    size_t trampBytes = (size_t)blockSize + HOOK_PATCH_SIZE;
+
+    memcpy((void *)tramp, trampoline, trampBytes);
+    sys_icache_invalidate((void *)tramp, trampBytes);
+
+    uint8_t patch[HOOK_PATCH_SIZE];
+    hook_build_patch(repl, patch);
+
+    if (!hook_write_bytes(addr, patch, HOOK_PATCH_SIZE)) {
+        mach_vm_deallocate(mach_task_self(), (mach_vm_address_t)tramp, HOOK_TRAMP_SIZE);
+        entry->used = false;
+        pthread_mutex_unlock(&g_lock);
+        hook_set_error("install: patch write failed at %p", (void *)addr);
+        return false;
+    }
+
+    entry->tramp = tramp;
+    entry->replacement = repl;
+    entry->block_bytes = (uint32_t)blockSize;
+    entry->near = near;
+    memcpy(entry->patch, patch, HOOK_PATCH_SIZE);
+    entry->armed = true;
+
+    g_install_count++;
+    g_ready = true;
+
+    pthread_mutex_unlock(&g_lock);
+
+    brk_diag_log("install target=%p replacement=%p tramp=%p block=%d near=%d saved=%08x %08x %08x %08x status=1",
+                 (void *)addr,
+                 (void *)repl,
+                 (void *)tramp,
+                 blockSize,
+                 near ? 1 : 0,
+                 original[0], original[1], original[2], original[3]);
+
+    return true;
 }
 
 bool brk_observe(void *target)
 {
-    return register_slot(-1, target, NULL, true);
+    if (!target) return false;
+
+    uintptr_t addr = strip_fn(target);
+
+    pthread_mutex_lock(&g_lock);
+    hook_entry_t *entry = hook_find_locked(addr);
+    bool present = (entry != NULL);
+    pthread_mutex_unlock(&g_lock);
+
+    return present;
 }
 
 bool brk_install_raw_slot(int slot, void *target, void *replacement)
 {
-    return register_slot(slot, target, replacement, false);
+    if (slot < 0 || slot >= HOOK_MAX) return false;
+    return brk_install(target, replacement);
 }
 
 bool brk_remove(void *target)
 {
-    if (!target || !initialize()) return false;
+    if (!target) return false;
 
-    uintptr_t t = strip_pointer(target);
-    bool found = false;
+    uintptr_t addr = strip_fn(target);
 
     pthread_mutex_lock(&g_lock);
 
-    for (int i = 0; i < BRK_MAX; ++i) {
-        if (g_entries[i].used && g_entries[i].target == t) {
-            g_entries[i].armed = false;
-            g_entries[i].used = false;
-            found = true;
-        }
+    hook_entry_t *entry = hook_find_locked(addr);
+
+    if (!entry || !entry->armed) {
+        pthread_mutex_unlock(&g_lock);
+        return false;
     }
 
-    bool synced = sync_locked();
+    bool restored = hook_write_bytes(entry->target, entry->saved, HOOK_PATCH_SIZE);
+
+    if (entry->tramp) {
+        mach_vm_deallocate(mach_task_self(), (mach_vm_address_t)entry->tramp, HOOK_TRAMP_SIZE);
+    }
+
+    memset(entry, 0, sizeof(hook_entry_t));
 
     pthread_mutex_unlock(&g_lock);
 
-    brk_diag_log(
-        "remove target=%p found=%d synced=%d",
-        (void *)t,
-        found,
-        synced
-    );
-
-    return found && synced;
+    brk_diag_log("remove target=%p status=%d", (void *)addr, restored ? 1 : 0);
+    return restored;
 }
 
 bool brk_remove_raw(void *target)
@@ -1067,439 +966,393 @@ bool brk_remove_raw(void *target)
 
 uint64_t brk_hits(void *target)
 {
-    uintptr_t t = strip_pointer(target);
-    uint64_t hits = 0;
+    if (!target) return 0;
+
+    uintptr_t addr = strip_fn(target);
 
     pthread_mutex_lock(&g_lock);
+    hook_entry_t *entry = hook_find_locked(addr);
+    uint64_t hits = entry ? entry->hits : 0;
+    pthread_mutex_unlock(&g_lock);
 
-    for (int i = 0; i < BRK_MAX; ++i) {
-        if (g_entries[i].used && g_entries[i].target == t) {
-            hits = g_entries[i].hits;
+    return hits;
+}
+
+void hook_note_hit(void *target)
+{
+    if (!target) return;
+
+    uintptr_t addr = strip_fn(target);
+
+    for (int i = 0; i < HOOK_MAX; i++) {
+        if (g_hooks[i].used && g_hooks[i].target == addr) {
+            g_hooks[i].hits++;
             break;
         }
     }
 
-    pthread_mutex_unlock(&g_lock);
-    return hits;
+    g_total_hits++;
 }
 
-__attribute__((noinline))
-static void probe_target(void)
+void *brk_original_ptr(void *target)
 {
-    g_probe_value = 100;
+    if (!target) return NULL;
+
+    uintptr_t addr = strip_fn(target);
+
+    pthread_mutex_lock(&g_lock);
+    hook_entry_t *entry = hook_find_locked(addr);
+    uintptr_t tramp = (entry && entry->armed) ? entry->tramp : 0;
+    pthread_mutex_unlock(&g_lock);
+
+    if (!tramp) return (void *)addr;
+
+    return (void *)strip_fn((const void *)tramp);
 }
 
-__attribute__((noinline))
-static void probe_replacement(void)
+void brk_suspend_self(void)
 {
     g_probe_value = 1;
 }
 
-void *brk_selftest_addr(void)
+void brk_resume_self(void)
 {
-    return (void *)&probe_target;
-}
-
-bool brk_calibrate_slots(void)
-{
-    if (!initialize() || brk_active_count() != 0) return false;
-
-    uint32_t mask = 0;
-
-    for (int slot = 0; slot < g_physical_limit; ++slot) {
-        g_probe_value = 0;
-
-        bool installed = brk_install_raw_slot(
-            slot,
-            (void *)&probe_target,
-            (void *)&probe_replacement
-        );
-
-        if (installed) {
-            probe_target();
-
-            if (g_probe_value == 1) mask |= 1U << slot;
-
-            brk_remove((void *)&probe_target);
-        }
-
-        brk_diag_log(
-            "calibration slot=%d installed=%d value=%d",
-            slot,
-            installed,
-            g_probe_value
-        );
-    }
-
-    pthread_mutex_lock(&g_lock);
-    g_live_mask = mask;
-    pthread_mutex_unlock(&g_lock);
-
-    brk_diag_log(
-        "calibration live_mask=0x%x live_count=%d",
-        mask,
-        __builtin_popcount(mask)
-    );
-
-    return mask != 0;
-}
-
-bool brk_selftest(void)
-{
-    if (!brk_install(
-            (void *)&probe_target,
-            (void *)&probe_replacement)) return false;
-
     g_probe_value = 0;
-    probe_target();
-
-    int value = g_probe_value;
-    bool removed = brk_remove((void *)&probe_target);
-
-    brk_diag_log(
-        "selftest value=%d removed=%d",
-        value,
-        removed
-    );
-
-    return value == 1 && removed;
-}
-
-int brk_live_slot_count(void)
-{
-    if (!initialize()) return 0;
-
-    pthread_mutex_lock(&g_lock);
-    int count = __builtin_popcount(g_live_mask);
-    pthread_mutex_unlock(&g_lock);
-
-    return count;
 }
 
 int brk_slot_limit(void)
 {
+    return HOOK_MAX;
+}
+
+int brk_live_slot_count(void)
+{
+    int live = 0;
+
+    pthread_mutex_lock(&g_lock);
+    for (int i = 0; i < HOOK_MAX; i++) {
+        if (g_hooks[i].used && g_hooks[i].armed) live++;
+    }
+    pthread_mutex_unlock(&g_lock);
+
+    return live;
+}
+
+int brk_active_count(void)
+{
     return brk_live_slot_count();
+}
+
+bool brk_calibrate_slots(void)
+{
+    return brk_slot_limit() > 0;
 }
 
 int brk_next_slot(int after)
 {
-    if (!initialize()) return -1;
-    if (after < -1) after = -1;
-    if (after >= BRK_MAX - 1) return -1;
+    int result = -1;
 
     pthread_mutex_lock(&g_lock);
 
-    int result = -1;
-
-    for (int i = after + 1; i < g_physical_limit; ++i) {
-        if (g_live_mask & (1U << i)) {
+    for (int i = after + 1; i < HOOK_MAX; i++) {
+        if (!g_hooks[i].used) {
             result = i;
             break;
         }
     }
 
     pthread_mutex_unlock(&g_lock);
+
     return result;
 }
 
-int brk_active_count(void)
+void hook_selftest_probe(void) {}
+
+static volatile int g_selftest_hits = 0;
+
+typedef int (*hook_selftest_fn)(int);
+
+static volatile hook_selftest_fn g_selftest_call = NULL;
+
+static int hook_selftest_replacement(int value)
 {
-    pthread_mutex_lock(&g_lock);
-
-    int count = 0;
-
-    for (int i = 0; i < BRK_MAX; ++i) {
-        if (g_entries[i].used) count++;
-    }
-
-    pthread_mutex_unlock(&g_lock);
-    return count;
+    g_selftest_hits++;
+    return value + 1000;
 }
 
-void *brk_original_ptr(void *target)
+bool brk_selftest(void)
 {
-    return target ? sign_pointer(strip_pointer(target)) : NULL;
+    g_selftest_hits = 0;
+
+    void *page = mmap(NULL, 0x4000,
+                      PROT_READ | PROT_WRITE | PROT_EXEC,
+                      MAP_PRIVATE | MAP_ANON, -1, 0);
+
+    if (page == MAP_FAILED) {
+        hook_set_error("selftest: mmap failed errno=%d", errno);
+        return false;
+    }
+
+    uint32_t code[3];
+    code[0] = 0x52800020u;
+    code[1] = 0x11000400u;
+    code[2] = 0xD65F03C0u;
+
+    memcpy(page, code, sizeof(code));
+    sys_icache_invalidate(page, sizeof(code));
+
+    g_selftest_call = (hook_selftest_fn)sign_fn((uintptr_t)page);
+
+    int baseline = g_selftest_call(1);
+
+    if (baseline != 2) {
+        hook_set_error("selftest: baseline call returned %d", baseline);
+        munmap(page, 0x4000);
+        g_selftest_call = NULL;
+        return false;
+    }
+
+    if (!brk_install(page, (void *)hook_selftest_replacement)) {
+        munmap(page, 0x4000);
+        g_selftest_call = NULL;
+        return false;
+    }
+
+    int intercepted = g_selftest_call(1);
+
+    hook_selftest_fn original = (hook_selftest_fn)brk_original_ptr(page);
+    int viaOriginal = original ? original(1) : -1;
+
+    bool ok = (intercepted == 1001) && (g_selftest_hits == 1) && (viaOriginal == 2);
+
+    if (ok) {
+        brk_diag_log("selftest inline patch verified intercepted=%d via_original=%d hits=%d",
+                     intercepted, viaOriginal, g_selftest_hits);
+    } else {
+        hook_set_error("selftest: intercepted=%d hits=%d via_original=%d",
+                       intercepted, g_selftest_hits, viaOriginal);
+    }
+
+    brk_remove(page);
+    munmap(page, 0x4000);
+    g_selftest_call = NULL;
+
+    return ok;
 }
 
-void brk_suspend_self(void)
+void *brk_selftest_addr(void)
 {
-    if (!initialize()) return;
-    if (g_pause_depth++) return;
-
-    mach_port_t self = mach_thread_self();
-
-    pthread_mutex_lock(&g_lock);
-
-    int selected = -1;
-
-    for (int i = 0; i < BRK_PAUSED_MAX; ++i) {
-        if (g_paused[i] == MACH_PORT_NULL) {
-            selected = i;
-            break;
-        }
-    }
-
-    if (selected >= 0) {
-        g_paused[selected] = self;
-        g_pause_port = self;
-        merge_thread_locked(self, false);
-    }
-
-    pthread_mutex_unlock(&g_lock);
-
-    if (selected < 0) {
-        g_pause_depth = 0;
-        mach_port_deallocate(mach_task_self(), self);
-    }
-}
-
-void brk_resume_self(void)
-{
-    if (!g_pause_depth || --g_pause_depth) return;
-
-    pthread_mutex_lock(&g_lock);
-
-    for (int i = 0; i < BRK_PAUSED_MAX; ++i) {
-        if (g_paused[i] == g_pause_port) {
-            g_paused[i] = MACH_PORT_NULL;
-            break;
-        }
-    }
-
-    sync_locked();
-
-    pthread_mutex_unlock(&g_lock);
-
-    if (g_pause_port != MACH_PORT_NULL) {
-        mach_port_deallocate(mach_task_self(), g_pause_port);
-        g_pause_port = MACH_PORT_NULL;
-    }
+    return (void *)&hook_selftest_probe;
 }
 
 void brk_log_state(void)
 {
-    if (!initialize()) {
-        brk_diag_log("state initialization_failed");
-        return;
-    }
-
     pthread_mutex_lock(&g_lock);
 
-    for (int slot = 0; slot < BRK_MAX; ++slot) {
-        if (!g_entries[slot].used) continue;
+    int live = 0;
 
-        brk_diag_log(
-            "entry slot=%d target=%p replacement=%p armed=%d observe=%d hits=%llu",
-            slot,
-            (void *)g_entries[slot].target,
-            (void *)g_entries[slot].replacement,
-            g_entries[slot].armed,
-            g_entries[slot].observe,
-            (unsigned long long)g_entries[slot].hits
-        );
+    for (int i = 0; i < HOOK_MAX; i++) {
+        if (g_hooks[i].used && g_hooks[i].armed) live++;
     }
 
-    brk_diag_log(
-        "state task_port_owned=%d chained=%d chain_hits=%llu chain_fails=%llu",
-        task_port_status(),
-        g_chain ? 1 : 0,
-        (unsigned long long)g_chain_hits,
-        (unsigned long long)g_chain_fails
-    );
+    brk_diag_log("state slots=%d live=%d installed=%llu hits=%llu fails=%llu",
+                 HOOK_MAX,
+                 live,
+                 (unsigned long long)g_install_count,
+                 (unsigned long long)g_total_hits,
+                 (unsigned long long)g_fail_count);
+
+    for (int i = 0; i < HOOK_MAX; i++) {
+        if (!g_hooks[i].used) continue;
+
+        brk_diag_log("slot %d target=%p tramp=%p replacement=%p block=%u near=%d armed=%d hits=%llu",
+                     i,
+                     (void *)g_hooks[i].target,
+                     (void *)g_hooks[i].tramp,
+                     (void *)g_hooks[i].replacement,
+                     g_hooks[i].block_bytes,
+                     g_hooks[i].near ? 1 : 0,
+                     g_hooks[i].armed ? 1 : 0,
+                     (unsigned long long)g_hooks[i].hits);
+    }
 
     pthread_mutex_unlock(&g_lock);
 }
 
-int brk_census(
-    uint64_t *expected_bvr,
-    int max_slots,
-    int *threads_total)
+int brk_census(uint64_t *outHits, uint64_t *outFails, int *outLive)
 {
-    if (!expected_bvr || max_slots < 1) return -1;
-    if (max_slots > BRK_MAX) max_slots = BRK_MAX;
+    if (outHits) *outHits = g_total_hits;
+    if (outFails) *outFails = g_fail_count;
+    if (outLive) *outLive = brk_live_slot_count();
 
-    thread_act_array_t threads = NULL;
-    mach_msg_type_number_t count = 0;
+    return brk_live_slot_count();
+}
 
-    kern_return_t kr = task_threads(
-        mach_task_self(),
-        &threads,
-        &count
-    );
+void brk_trace_exception(const char *label)
+{
+    brk_diag_log("trace label=%s live=%d hits=%llu",
+                 label ? label : "?",
+                 brk_live_slot_count(),
+                 (unsigned long long)g_total_hits);
+}
 
-    if (kr != KERN_SUCCESS) return -1;
+static bool hook_name_marks_host_runtime(const char *name)
+{
+    if (!name) return false;
 
-    int matchedThreads = 0;
+    static const char *marks[] = {
+        "TweakLoader",
+        "LiveContainer",
+        "LiveContainerShared",
+        "CydiaSubstrate",
+        "libellekit",
+        "SubstrateLoader",
+        NULL
+    };
 
-    for (mach_msg_type_number_t i = 0; i < count; ++i) {
-        arm_debug_state64_t debug;
-        mach_msg_type_number_t words = ARM_DEBUG_STATE64_COUNT;
-
-        kr = thread_get_state(
-            threads[i],
-            ARM_DEBUG_STATE64,
-            (thread_state_t)&debug,
-            &words
-        );
-
-        bool matched = kr == KERN_SUCCESS;
-
-        if (matched) {
-            for (int slot = 0; slot < max_slots; ++slot) {
-                if (!expected_bvr[slot]) continue;
-
-                bool same =
-                    debug.__bvr[slot] == expected_bvr[slot] &&
-                    (debug.__bcr[slot] & BRK_VERIFY_MASK) ==
-                        (BRK_BCR & BRK_VERIFY_MASK);
-
-                if (!same) matched = false;
-            }
-        }
-
-        if (matched) matchedThreads++;
-
-        mach_port_deallocate(mach_task_self(), threads[i]);
+    for (int i = 0; marks[i]; ++i) {
+        if (strstr(name, marks[i])) return true;
     }
-
-    vm_deallocate(
-        mach_task_self(),
-        (vm_address_t)threads,
-        count * sizeof(thread_act_t)
-    );
-
-    if (threads_total) *threads_total = (int)count;
-
-    return matchedThreads;
-}
-
-void brk_trace_exception(
-    uint64_t exception,
-    uint64_t code0,
-    uint64_t code1,
-    uint64_t pc,
-    int matched_slot)
-{
-    brk_diag_log(
-        "trace type=%llu code0=0x%llx code1=0x%llx pc=%p slot=%d",
-        (unsigned long long)exception,
-        (unsigned long long)code0,
-        (unsigned long long)code1,
-        (void *)(uintptr_t)pc,
-        matched_slot
-    );
-}
-
-bool brk_arm_function_rva(
-    uintptr_t image_base,
-    uint64_t rva,
-    void *replacement)
-{
-    if (!image_base || !rva || rva > UINTPTR_MAX - image_base) return false;
-
-    return brk_install(
-        (void *)(image_base + (uintptr_t)rva),
-        replacement
-    );
-}
-
-bool brk_chain_active(void)
-{
-    initialize();
-    return g_chain;
-}
-
-bool brk_host_is_livecontainer(void)
-{
-    return detect_livecontainer();
-}
-
-mach_port_t brk_previous_port(void)
-{
-    return g_prev_valid ? g_prev_port : MACH_PORT_NULL;
-}
-
-uint64_t brk_chain_counters(uint64_t *fails)
-{
-    if (fails) *fails = g_chain_fails;
-    return g_chain_hits;
-}
-
-void brk_teardown(void)
-{
-    if (!g_ready) return;
-
-    pthread_mutex_lock(&g_lock);
-
-    for (int i = 0; i < BRK_MAX; ++i) {
-        g_entries[i].armed = false;
-        g_entries[i].used = false;
-    }
-
-    sync_locked();
-
-    pthread_mutex_unlock(&g_lock);
-
-    task_set_exception_ports(
-        mach_task_self(),
-        EXC_MASK_BREAKPOINT,
-        MACH_PORT_NULL,
-        EXCEPTION_STATE_IDENTITY | MACH_EXCEPTION_CODES,
-        ARM_THREAD_STATE64
-    );
-
-    if (g_port != MACH_PORT_NULL) {
-        mach_port_deallocate(mach_task_self(), g_port);
-        g_port = MACH_PORT_NULL;
-    }
-
-    g_ready = false;
-
-    if (g_prev_valid && g_prev_port != MACH_PORT_NULL) {
-        kern_return_t kr = task_set_exception_ports(
-            mach_task_self(),
-            g_prev_mask,
-            g_prev_port,
-            g_prev_behavior,
-            g_prev_flavor
-        );
-
-        brk_diag_log(
-            "teardown restored_previous_port=%u kr=%d",
-            (unsigned)g_prev_port,
-            kr
-        );
-
-        mach_port_deallocate(mach_task_self(), g_prev_port);
-        g_prev_port = MACH_PORT_NULL;
-        g_prev_valid = false;
-    }
-}
-
-bool hook(void *oldArr[], void *newArr[], int count)
-{
-    if (!oldArr || !newArr || count < 1) return false;
-
-    int installed = 0;
-
-    for (; installed < count; ++installed) {
-        if (!brk_install(oldArr[installed], newArr[installed])) break;
-    }
-
-    if (installed == count) return true;
-
-    for (int i = 0; i < installed; ++i) brk_remove(oldArr[i]);
 
     return false;
 }
 
-bool unhook(void *oldArr[], int count)
+bool brk_host_is_livecontainer(void)
 {
-    if (!oldArr || count < 1) return false;
+    uint32_t count = _dyld_image_count();
+
+    if (count > 8192) count = 8192;
+
+    for (uint32_t i = 0; i < count; ++i) {
+        if (hook_name_marks_host_runtime(_dyld_get_image_name(i))) return true;
+    }
+
+    if (dlsym(RTLD_DEFAULT, "LiveContainerMain") != NULL) return true;
+
+    const char *home = getenv("HOME");
+
+    if (home) {
+        char probe[1024];
+        snprintf(probe, sizeof(probe), "%s/Documents/Tweaks", home);
+        if (access(probe, F_OK) == 0) return true;
+    }
+
+    return false;
+}
+
+bool brk_chain_active(void)
+{
+    return false;
+}
+
+mach_port_t brk_previous_port(void)
+{
+    exception_mask_t masks[EXC_TYPES_COUNT];
+    mach_port_t ports[EXC_TYPES_COUNT];
+    exception_behavior_t behaviors[EXC_TYPES_COUNT];
+    thread_state_flavor_t flavors[EXC_TYPES_COUNT];
+    mach_msg_type_number_t count = EXC_TYPES_COUNT;
+
+    kern_return_t kr = task_get_exception_ports(
+        mach_task_self(),
+        EXC_MASK_BREAKPOINT,
+        masks,
+        &count,
+        ports,
+        behaviors,
+        flavors
+    );
+
+    if (kr != KERN_SUCCESS) return MACH_PORT_NULL;
+
+    mach_port_t observed = MACH_PORT_NULL;
+
+    for (mach_msg_type_number_t i = 0; i < count; ++i) {
+        if (ports[i] != MACH_PORT_NULL) {
+            if (observed == MACH_PORT_NULL) observed = ports[i];
+            mach_port_deallocate(mach_task_self(), ports[i]);
+        }
+    }
+
+    return observed;
+}
+
+uint64_t brk_chain_counters(uint64_t *fails)
+{
+    if (fails) *fails = g_fail_count;
+    return g_total_hits;
+}
+
+bool brk_arm_function_rva(uintptr_t imageBase, uintptr_t rva, void *replacement, void **outOriginal)
+{
+    if (!imageBase || !rva || !replacement) return false;
+
+    uintptr_t target = imageBase + rva;
+
+    if (!brk_install((void *)target, replacement)) return false;
+
+    if (outOriginal) *outOriginal = brk_original_ptr((void *)target);
+
+    return true;
+}
+
+void brk_teardown(void)
+{
+    pthread_mutex_lock(&g_lock);
+
+    for (int i = 0; i < HOOK_MAX; i++) {
+        if (!g_hooks[i].used) continue;
+
+        if (g_hooks[i].armed) {
+            hook_write_bytes(g_hooks[i].target, g_hooks[i].saved, HOOK_PATCH_SIZE);
+        }
+
+        if (g_hooks[i].tramp) {
+            mach_vm_deallocate(mach_task_self(),
+                               (mach_vm_address_t)g_hooks[i].tramp,
+                               HOOK_TRAMP_SIZE);
+        }
+
+        memset(&g_hooks[i], 0, sizeof(hook_entry_t));
+    }
+
+    g_ready = false;
+
+    pthread_mutex_unlock(&g_lock);
+
+    brk_diag_log("teardown complete");
+}
+
+bool hook(void *oldArr[], void *newArr[], int count)
+{
+    if (!oldArr || !newArr || count <= 0) return false;
 
     bool ok = true;
 
-    for (int i = 0; i < count; ++i) {
+    for (int i = 0; i < count; i++) {
+        if (!oldArr[i] || !newArr[i]) {
+            ok = false;
+            continue;
+        }
+
+        if (!brk_install(oldArr[i], newArr[i])) ok = false;
+    }
+
+    return ok;
+}
+
+bool unhook(void *oldArr[], int count)
+{
+    if (!oldArr || count <= 0) return false;
+
+    bool ok = true;
+
+    for (int i = 0; i < count; i++) {
+        if (!oldArr[i]) {
+            ok = false;
+            continue;
+        }
+
         if (!brk_remove(oldArr[i])) ok = false;
     }
 
