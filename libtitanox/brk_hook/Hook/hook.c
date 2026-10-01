@@ -838,8 +838,32 @@ static int hook_emit_block(uintptr_t src, uintptr_t dst, const uint32_t *in, uin
 
 static uintptr_t g_cave_cursor = 0;
 
+static bool hook_cave_is_padding(uintptr_t runStart)
+{
+    uint32_t words[4];
+    uintptr_t base = runStart - sizeof(words);
+
+    if (!hook_read_bytes(base, words, sizeof(words))) return false;
+
+    for (int i = 3; i >= 0; i--) {
+        uint32_t word = words[i];
+
+        if (word == 0xD503201F) continue;
+
+        if (word == 0xD65F03C0) return true;
+        if (word == 0xD65F0FFF) return true;
+        if ((word & 0xFFFFFC1Fu) == 0xD65F0000u) return true;
+        if ((word & 0xFC000000u) == 0x14000000u) return true;
+        if ((word & 0xFFE0001Fu) == 0xD4200000u) return true;
+
+        return false;
+    }
+
+    return false;
+}
+
 static uintptr_t hook_find_cave_in_region(uintptr_t regionStart, uintptr_t regionEnd,
-                                          size_t need, uintptr_t avoid, uintptr_t avoidSize)
+                                           size_t need, uintptr_t avoid, uintptr_t avoidSize)
 {
     if (!regionStart || regionEnd <= regionStart) return 0;
     if ((regionEnd - regionStart) < need) return 0;
@@ -888,6 +912,8 @@ static uintptr_t hook_find_cave_in_region(uintptr_t regionStart, uintptr_t regio
             if ((candidate + need) > regionEnd) continue;
 
             if ((candidate + avoidSize) > avoid && candidate < (avoid + avoidSize)) continue;
+
+            if (!hook_cave_is_padding(runStart)) continue;
 
             return candidate;
         }
@@ -1041,8 +1067,7 @@ bool hook_code_patch_allowed(void)
 {
     const char *flag = getenv("TITANOX_ALLOW_CODE_PATCH");
 
-    if (!flag) return false;
-    if (flag[0] == '0') return false;
+    if (flag && flag[0] == '0') return false;
 
     return true;
 }
@@ -1530,6 +1555,8 @@ int hook_probe(uintptr_t target)
     return hits;
 }
 
+static bool hook_code_install(uintptr_t addr, uintptr_t repl);
+
 bool brk_install(void *target, void *replacement)
 {
     if (!target || !replacement) {
@@ -1539,6 +1566,35 @@ bool brk_install(void *target, void *replacement)
 
     uintptr_t addr = strip_fn(target);
     uintptr_t repl = strip_fn(replacement);
+
+    if (hook_code_patch_allowed() && hook_code_install(addr, repl)) return true;
+
+    brk_diag_log("install: inline patch unavailable at %p (%s), trying pointer slot",
+                 (void *)addr, hook_last_error());
+
+    int hits = hook_pointer_install(addr, repl);
+
+    if (hits > 0) {
+        g_install_count++;
+        g_ready = true;
+
+        brk_diag_log("install target=%p replacement=%p mode=pointer slots=%d status=1",
+                     (void *)addr, (void *)repl, hits);
+
+        return true;
+    }
+
+    g_fail_count++;
+
+    return false;
+}
+
+static bool hook_code_install(uintptr_t addr, uintptr_t repl)
+{
+    if (!addr || !repl) {
+        hook_set_error("install: null argument addr=%p replacement=%p", (void *)addr, (void *)repl);
+        return false;
+    }
 
     vm_prot_t prot = 0;
     uintptr_t regionStart = 0;
@@ -1561,23 +1617,6 @@ bool brk_install(void *target, void *replacement)
 
     if ((prot & VM_PROT_EXECUTE) == 0) {
         hook_set_error("install: target %p not executable (prot=%d)", (void *)addr, (int)prot);
-        g_fail_count++;
-        return false;
-    }
-
-    if (!hook_code_patch_allowed()) {
-        int hits = hook_pointer_install(addr, repl);
-
-        if (hits > 0) {
-            g_install_count++;
-            g_ready = true;
-
-            brk_diag_log("install target=%p replacement=%p mode=pointer slots=%d status=1",
-                         (void *)addr, (void *)repl, hits);
-
-            return true;
-        }
-
         g_fail_count++;
         return false;
     }
