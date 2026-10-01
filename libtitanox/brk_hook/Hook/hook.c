@@ -42,6 +42,7 @@ typedef struct {
     bool used;
     bool armed;
     bool near;
+    bool from_cave;
 } hook_entry_t;
 
 static hook_entry_t g_hooks[HOOK_MAX];
@@ -757,9 +758,121 @@ static int hook_emit_block(uintptr_t src, uintptr_t dst, const uint32_t *in, uin
     return offset;
 }
 
-static uintptr_t hook_alloc_trampoline(uintptr_t target, size_t size, bool *near)
+static uintptr_t g_cave_cursor = 0;
+
+static uintptr_t hook_find_cave_in_region(uintptr_t regionStart, uintptr_t regionEnd,
+                                          size_t need, uintptr_t avoid, uintptr_t avoidSize)
+{
+    if (!regionStart || regionEnd <= regionStart) return 0;
+    if ((regionEnd - regionStart) < need) return 0;
+
+    uint8_t buffer[4096];
+    uintptr_t cursor = regionStart;
+
+    while ((cursor + need) <= regionEnd) {
+        size_t want = sizeof(buffer);
+        if ((cursor + want) > regionEnd) want = (size_t)(regionEnd - cursor);
+
+        vm_size_t got = 0;
+
+        kern_return_t kr = vm_read_overwrite(
+            mach_task_self(),
+            (vm_address_t)cursor,
+            (vm_size_t)want,
+            (vm_address_t)buffer,
+            &got
+        );
+
+        if (kr != KERN_SUCCESS || got < 4) {
+            cursor = (cursor + 0x1000) & ~0xFFFULL;
+            continue;
+        }
+
+        size_t run = 0;
+
+        for (size_t i = 0; (i + 4) <= got; i += 4) {
+            uint32_t word = 0;
+            memcpy(&word, buffer + i, 4);
+
+            if (word != 0) {
+                run = 0;
+                continue;
+            }
+
+            run += 4;
+
+            if (run < need) continue;
+
+            uintptr_t runStart = cursor + i + 4 - run;
+            uintptr_t candidate = (runStart + 7) & ~7ULL;
+
+            if ((candidate + need) > (runStart + run)) continue;
+            if ((candidate + need) > regionEnd) continue;
+
+            if ((candidate + avoidSize) > avoid && candidate < (avoid + avoidSize)) continue;
+
+            return candidate;
+        }
+
+        size_t advance = want;
+
+        if (want > (need + 4)) advance = want - need - 4;
+        if (advance < 4) advance = 4;
+
+        cursor += advance;
+    }
+
+    return 0;
+}
+
+static uintptr_t hook_alloc_from_cave(uintptr_t target, size_t size, bool *near)
+{
+    vm_prot_t prot = 0;
+    uintptr_t regionStart = 0;
+    uintptr_t regionEnd = 0;
+
+    if (!hook_region_info(target, &prot, &regionStart, &regionEnd)) return 0;
+    if ((prot & VM_PROT_EXECUTE) == 0) return 0;
+
+    uintptr_t floor = regionStart + 0x4000;
+    if (floor >= regionEnd) return 0;
+
+    uintptr_t avoid = target & ~0xFFFULL;
+
+    uintptr_t from = g_cave_cursor;
+    if (from < floor || (from + size) > regionEnd) from = floor;
+
+    uintptr_t cave = hook_find_cave_in_region(from, regionEnd, size, avoid, 0x1000);
+
+    if (!cave && from != floor) {
+        cave = hook_find_cave_in_region(floor, regionEnd, size, avoid, 0x1000);
+    }
+
+    if (!cave) return 0;
+
+    g_cave_cursor = cave + size;
+
+    if (near) *near = true;
+
+    brk_diag_log("trampoline cave target=%p cave=%p region=%p-%p",
+                 (void *)target, (void *)cave, (void *)regionStart, (void *)regionEnd);
+
+    return cave;
+}
+
+static uintptr_t hook_alloc_trampoline(uintptr_t target, size_t size, bool *near, bool *fromCave)
 {
     if (near) *near = false;
+    if (fromCave) *fromCave = false;
+
+    uintptr_t cave = hook_alloc_from_cave(target, size, near);
+
+    if (cave) {
+        if (fromCave) *fromCave = true;
+        return cave;
+    }
+
+    brk_diag_log("trampoline: no code cave for %p, falling back to mmap", (void *)target);
 
     void *mapped = mmap(NULL, size, PROT_READ | PROT_WRITE,
                         MAP_PRIVATE | MAP_ANON, -1, 0);
@@ -773,30 +886,6 @@ static uintptr_t hook_alloc_trampoline(uintptr_t target, size_t size, bool *near
                      mapped, (long long)((int64_t)(uintptr_t)mapped - (int64_t)target));
 
         return (uintptr_t)mapped;
-    }
-
-    brk_diag_log("trampoline mmap failed errno=%d, fixed sweep", errno);
-
-    uintptr_t page = target & ~0xFFFULL;
-
-    for (int64_t step = 0x10000; step <= (int64_t)HOOK_NEAR_RANGE; step += 0x10000) {
-        for (int dir = 0; dir < 2; dir++) {
-            vm_address_t candidate =
-                dir ? (vm_address_t)(page + (uintptr_t)step)
-                    : (vm_address_t)(page - (uintptr_t)step);
-
-            if (candidate < 0x100000000ULL) continue;
-
-            kern_return_t kr = vm_allocate(mach_task_self(), &candidate, size, 0);
-            if (kr != KERN_SUCCESS) continue;
-
-            vm_protect(mach_task_self(), candidate, size, FALSE,
-                       VM_PROT_READ | VM_PROT_WRITE);
-
-            if (near) *near = true;
-            brk_diag_log("trampoline fixed alloc tramp=%p", (void *)candidate);
-            return (uintptr_t)candidate;
-        }
     }
 
     size_t bigger = size * 4;
@@ -927,7 +1016,8 @@ bool brk_install(void *target, void *replacement)
     }
 
     bool near = false;
-    uintptr_t tramp = hook_alloc_trampoline(addr, HOOK_TRAMP_SIZE, &near);
+    bool fromCave = false;
+    uintptr_t tramp = hook_alloc_trampoline(addr, HOOK_TRAMP_SIZE, &near, &fromCave);
 
     if (!tramp) {
         entry->used = false;
@@ -958,20 +1048,31 @@ bool brk_install(void *target, void *replacement)
 
     size_t trampBytes = (size_t)blockSize + HOOK_PATCH_SIZE;
 
-    memcpy((void *)tramp, trampoline, trampBytes);
+    if (fromCave) {
+        if (!hook_write_bytes(tramp, trampoline, trampBytes)) {
+            entry->used = false;
+            pthread_mutex_unlock(&g_lock);
+            hook_set_error("install: cannot write trampoline into code cave at %p", (void *)tramp);
+            return false;
+        }
 
-    hook_log_prot("trampoline before RX", tramp);
+        hook_log_prot("trampoline in cave", tramp);
+    } else {
+        memcpy((void *)tramp, trampoline, trampBytes);
 
-    if (!hook_make_executable(tramp, trampBytes)) {
-        hook_log_prot("trampoline after RX failed", tramp);
-        vm_deallocate(mach_task_self(), (vm_address_t)tramp, (vm_size_t)HOOK_TRAMP_SIZE);
-        entry->used = false;
-        pthread_mutex_unlock(&g_lock);
-        hook_set_error("install: trampoline at %p is not executable", (void *)tramp);
-        return false;
+        hook_log_prot("trampoline before RX", tramp);
+
+        if (!hook_make_executable(tramp, trampBytes)) {
+            hook_log_prot("trampoline after RX failed", tramp);
+            vm_deallocate(mach_task_self(), (vm_address_t)tramp, (vm_size_t)HOOK_TRAMP_SIZE);
+            entry->used = false;
+            pthread_mutex_unlock(&g_lock);
+            hook_set_error("install: trampoline at %p is not executable", (void *)tramp);
+            return false;
+        }
+
+        hook_log_prot("trampoline after RX", tramp);
     }
-
-    hook_log_prot("trampoline after RX", tramp);
 
     uint8_t patch[HOOK_PATCH_SIZE];
     hook_build_patch(repl, patch);
@@ -988,6 +1089,7 @@ bool brk_install(void *target, void *replacement)
     entry->replacement = repl;
     entry->block_bytes = (uint32_t)blockSize;
     entry->near = near;
+    entry->from_cave = fromCave;
     memcpy(entry->patch, patch, HOOK_PATCH_SIZE);
     entry->armed = true;
 
@@ -996,12 +1098,13 @@ bool brk_install(void *target, void *replacement)
 
     pthread_mutex_unlock(&g_lock);
 
-    brk_diag_log("install target=%p replacement=%p tramp=%p block=%d near=%d saved=%08x %08x %08x %08x status=1",
+    brk_diag_log("install target=%p replacement=%p tramp=%p block=%d near=%d cave=%d saved=%08x %08x %08x %08x status=1",
                  (void *)addr,
                  (void *)repl,
                  (void *)tramp,
                  blockSize,
                  near ? 1 : 0,
+                 fromCave ? 1 : 0,
                  original[0], original[1], original[2], original[3]);
 
     return true;
@@ -1044,7 +1147,7 @@ bool brk_remove(void *target)
 
     bool restored = hook_write_bytes(entry->target, entry->saved, HOOK_PATCH_SIZE);
 
-    if (entry->tramp) {
+    if (entry->tramp && !entry->from_cave) {
         vm_deallocate(mach_task_self(), (vm_address_t)entry->tramp, (vm_size_t)HOOK_TRAMP_SIZE);
     }
 
@@ -1177,57 +1280,71 @@ static int hook_selftest_replacement(int value)
     return value + 1000;
 }
 
-bool brk_selftest(void)
+bool brk_selftest_at(uintptr_t hint)
 {
     g_selftest_hits = 0;
-
-    void *page = mmap(NULL, 0x4000,
-                      PROT_READ | PROT_WRITE,
-                      MAP_PRIVATE | MAP_ANON, -1, 0);
-
-    if (page == MAP_FAILED) {
-        hook_set_error("selftest: mmap failed errno=%d", errno);
-        return false;
-    }
 
     uint32_t code[3];
     code[0] = 0x52800020u;
     code[1] = 0x11000400u;
     code[2] = 0xD65F03C0u;
 
-    memcpy(page, code, sizeof(code));
+    bool mapped = false;
+    uintptr_t page = 0;
 
-    hook_log_prot("selftest page before RX", (uintptr_t)page);
+    if (hint) page = hook_alloc_from_cave(hint, 64, NULL);
 
-    if (!hook_make_executable((uintptr_t)page, sizeof(code))) {
-        hook_log_prot("selftest page after RX failed", (uintptr_t)page);
-        hook_set_error("selftest: generated code cannot be made executable");
-        munmap(page, 0x4000);
-        return false;
+    if (page) {
+        brk_diag_log("selftest: test function placed in cave %p (hint=%p)",
+                     (void *)page, (void *)hint);
+
+        if (!hook_write_bytes(page, code, sizeof(code))) {
+            hook_set_error("selftest: cannot write test function into cave %p", (void *)page);
+            return false;
+        }
+    } else {
+        void *raw = mmap(NULL, 0x4000, PROT_READ | PROT_WRITE,
+                         MAP_PRIVATE | MAP_ANON, -1, 0);
+
+        if (raw == MAP_FAILED) {
+            hook_set_error("selftest: mmap failed errno=%d", errno);
+            return false;
+        }
+
+        mapped = true;
+        page = (uintptr_t)raw;
+
+        memcpy((void *)page, code, sizeof(code));
+
+        if (!hook_make_executable(page, sizeof(code))) {
+            hook_set_error("selftest: generated code cannot be made executable");
+            munmap((void *)page, 0x4000);
+            return false;
+        }
     }
 
-    hook_log_prot("selftest page after RX", (uintptr_t)page);
+    hook_log_prot("selftest page", page);
 
-    g_selftest_call = (hook_selftest_fn)sign_fn((uintptr_t)page);
+    g_selftest_call = (hook_selftest_fn)sign_fn(page);
 
     int baseline = g_selftest_call(1);
 
     if (baseline != 2) {
         hook_set_error("selftest: baseline call returned %d", baseline);
-        munmap(page, 0x4000);
+        if (mapped) munmap((void *)page, 0x4000);
         g_selftest_call = NULL;
         return false;
     }
 
-    if (!brk_install(page, (void *)hook_selftest_replacement)) {
-        munmap(page, 0x4000);
+    if (!brk_install((void *)page, (void *)hook_selftest_replacement)) {
+        if (mapped) munmap((void *)page, 0x4000);
         g_selftest_call = NULL;
         return false;
     }
 
     int intercepted = g_selftest_call(1);
 
-    hook_selftest_fn original = (hook_selftest_fn)brk_original_ptr(page);
+    hook_selftest_fn original = (hook_selftest_fn)brk_original_ptr((void *)page);
     int viaOriginal = original ? original(1) : -1;
 
     bool ok = (intercepted == 1001) && (g_selftest_hits == 1) && (viaOriginal == 2);
@@ -1240,11 +1357,18 @@ bool brk_selftest(void)
                        intercepted, g_selftest_hits, viaOriginal);
     }
 
-    brk_remove(page);
-    munmap(page, 0x4000);
+    brk_remove((void *)page);
+
+    if (mapped) munmap((void *)page, 0x4000);
+
     g_selftest_call = NULL;
 
     return ok;
+}
+
+bool brk_selftest(void)
+{
+    return brk_selftest_at(0);
 }
 
 void *brk_selftest_addr(void)
@@ -1414,7 +1538,7 @@ void brk_teardown(void)
             hook_write_bytes(g_hooks[i].target, g_hooks[i].saved, HOOK_PATCH_SIZE);
         }
 
-        if (g_hooks[i].tramp) {
+        if (g_hooks[i].tramp && !g_hooks[i].from_cave) {
             vm_deallocate(mach_task_self(),
                           (vm_address_t)g_hooks[i].tramp,
                           (vm_size_t)HOOK_TRAMP_SIZE);
