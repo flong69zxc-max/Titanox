@@ -24,6 +24,12 @@ void hook_log_prot(const char *label, uintptr_t address);
 
 bool hook_verify_encryption(void *image);
 
+bool hook_code_patch_allowed(void);
+
+int hook_pointer_count(void);
+
+int hook_pointer_slots(void);
+
 bool brk_install(void *target, void *replacement);
 
 bool brk_observe(void *target);
