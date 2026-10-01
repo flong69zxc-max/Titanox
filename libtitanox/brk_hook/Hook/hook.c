@@ -436,18 +436,23 @@ static bool hook_page_restore(uintptr_t address, size_t length, vm_prot_t saved)
 
     brk_diag_log("restore: COPY|r-x failed kr=%d at %p", (int)g_last_kr, (void *)address);
 
-    if (hook_region_maxprot(address, &maxProt) && (maxProt & VM_PROT_EXECUTE)) {
-        if (hook_page_set(address, length,
-                          (vm_prot_t)(maxProt | VM_PROT_READ | VM_PROT_WRITE), TRUE, NULL) &&
-            hook_page_set(address, length, target, FALSE, NULL)) {
-            brk_diag_log("restore: maxprot rwx then r-x ok at %p", (void *)address);
-            return true;
-        }
+    hook_region_maxprot(address, &maxProt);
 
-        brk_diag_log("restore: maxprot rwx path failed kr=%d at %p", (int)g_last_kr, (void *)address);
-    } else {
-        brk_diag_log("restore: maxprot at %p has no EXECUTE", (void *)address);
+    brk_diag_log("restore: maxprot at %p = %c%c%c",
+                 (void *)address,
+                 (maxProt & VM_PROT_READ) ? 'r' : '-',
+                 (maxProt & VM_PROT_WRITE) ? 'w' : '-',
+                 (maxProt & VM_PROT_EXECUTE) ? 'x' : '-');
+
+    if (hook_page_set(address, length,
+                      (vm_prot_t)(maxProt | VM_PROT_READ | VM_PROT_WRITE | VM_PROT_EXECUTE),
+                      TRUE, NULL) &&
+        hook_page_set(address, length, target, FALSE, NULL)) {
+        brk_diag_log("restore: maxprot rwx then r-x ok at %p", (void *)address);
+        return true;
     }
+
+    brk_diag_log("restore: maxprot rwx path failed kr=%d at %p", (int)g_last_kr, (void *)address);
 
     hook_set_error("restore: failed at %p kr=%d", (void *)address, (int)g_last_kr);
 
