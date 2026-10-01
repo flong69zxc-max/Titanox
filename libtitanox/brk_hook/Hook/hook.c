@@ -1035,6 +1035,8 @@ typedef struct {
 static hook_ptr_entry_t g_ptr_hooks[HOOK_PTR_ENTRIES];
 static uint64_t g_ptr_writes = 0;
 
+static hook_ptr_entry_t *hook_pointer_find(uintptr_t target);
+
 bool hook_code_patch_allowed(void)
 {
     const char *flag = getenv("TITANOX_ALLOW_CODE_PATCH");
