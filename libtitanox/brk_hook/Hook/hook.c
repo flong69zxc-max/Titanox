@@ -1175,6 +1175,7 @@ static uint64_t g_scan_values = 0;
 static uint64_t g_scan_matches = 0;
 static uint64_t g_scan_offsets = 0;
 static uint64_t g_scan_slots_used = 0;
+static bool g_seg_layout_logged = false;
 
 typedef struct {
     int mode;
@@ -1323,7 +1324,7 @@ static int hook_scan_tables_value(uintptr_t imageBase, uintptr_t needle, uintptr
         uintptr_t start = (uintptr_t)seg->vmaddr + slide;
         uintptr_t end = start + (uintptr_t)seg->vmsize;
 
-        if (segments < 24) {
+        if (!g_seg_layout_logged && segments < 24) {
             brk_diag_log("scan %s seg %s %p-%p size=%llu initprot=%d maxprot=%d",
                          label ? label : "?",
                          seg->segname,
@@ -1402,6 +1403,8 @@ static int hook_scan_tables_value(uintptr_t imageBase, uintptr_t needle, uintptr
 
         cursor += cmd->cmdsize;
     }
+
+    g_seg_layout_logged = true;
 
     return hits;
 }
