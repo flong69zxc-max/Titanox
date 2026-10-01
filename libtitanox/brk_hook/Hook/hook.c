@@ -159,11 +159,6 @@ kern_return_t catch_mach_exception_raise_state(
                  (unsigned long long)(codeCnt > 0 ? code[0] : 0),
                  (unsigned long long)(codeCnt > 1 ? code[1] : 0));
 
-    if (g_orig_port != MACH_PORT_NULL) {
-        return mach_msg_server(mach_exc_server,
-                               sizeof(union __RequestUnion__catch_mach_exc_subsystem),
-                               g_orig_port, MACH_MSG_OPTION_NONE);
-    }
     return KERN_FAILURE;
 }
 
@@ -393,8 +388,6 @@ static bool brk_init(void) {
 
     g_ready = true;
     brk_file_log("init slot_limit=%d orig_port=%u\n", g_slot_limit, g_orig_port);
-
-    brk_calibrate_slots();
 
     if (!g_sweep_started) {
         g_sweep_started = true;
