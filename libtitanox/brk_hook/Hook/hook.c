@@ -179,7 +179,7 @@ static int task_port_status(void)
         if (ports[i] == g_port &&
             (masks[i] & EXC_MASK_BREAKPOINT) &&
             behaviors[i] ==
-                (EXCEPTION_STATE_IDENTITY | MACH_EXCEPTION_CODES) &&
+                (exception_behavior_t)(EXCEPTION_STATE_IDENTITY | MACH_EXCEPTION_CODES) &&
             flavors[i] == ARM_THREAD_STATE64) {
             owned = 1;
         }
@@ -547,7 +547,7 @@ static void init_once(void)
     );
 
     if (kr != KERN_SUCCESS) {
-        mach_port_destroy(mach_task_self(), g_port);
+        mach_port_deallocate(mach_task_self(), g_port);
         g_port = MACH_PORT_NULL;
         return;
     }
@@ -555,7 +555,7 @@ static void init_once(void)
     pthread_t server;
 
     if (pthread_create(&server, NULL, exception_loop, NULL) != 0) {
-        mach_port_destroy(mach_task_self(), g_port);
+        mach_port_deallocate(mach_task_self(), g_port);
         g_port = MACH_PORT_NULL;
         return;
     }
