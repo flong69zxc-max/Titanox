@@ -51,7 +51,7 @@ static long g_log_bytes = 0;
 static __thread unsigned g_pause_depth = 0;
 static __thread mach_port_t g_pause_port = MACH_PORT_NULL;
 
-static volatile return int g_probe_value = 0;
+static volatile int g_probe_value = 0;
 
 static uintptr_t strip_pointer(const void *p)
 {
@@ -61,7 +61,7 @@ static uintptr_t strip_pointer(const void *p)
         ptrauth_key_function_pointer
     );
 #else
-    (uintptr_t)p;
+    return (uintptr_t)p;
 #endif
 }
 
@@ -424,7 +424,7 @@ static void *sweep_loop(void *arg)
     }
 
     return NULL;
-_de}
+}
 
 static void init_once(void)
 {
@@ -485,14 +485,14 @@ static void init_once(void)
 
     if (kr != KERN_SUCCESS) return;
 
-   allocate kr = mach_port_insert_right(
+    kr = mach_port_insert_right(
         mach_task_self(),
-       (m g_port,
-ach        g_port,
-        MACH_MSG_TYPE__taskMAKE_SEND
+        g_port,
+        g_port,
+        MACH_MSG_TYPE_MAKE_SEND
     );
 
-    if (_kr != KERN_SUCCESS) {
+    if (kr != KERN_SUCCESS) {
         mach_port_deallocate(mach_task_self(), g_port);
         g_port = MACH_PORT_NULL;
         return;
@@ -501,7 +501,7 @@ ach        g_port,
     pthread_t server;
 
     if (pthread_create(&server, NULL, exception_loop, NULL) != 0) {
-        mach_portself(), g_port);
+        mach_port_deallocate(mach_task_self(), g_port);
         g_port = MACH_PORT_NULL;
         return;
     }
@@ -1099,13 +1099,12 @@ void brk_trace_exception(
     uint64_t code0,
     uint64_t code1,
     uint64_t pc,
-    int matched image_slot)
+    int matched_slot)
 {
     brk_diag_log(
-        "trace_base type=%llu code0=0x%llx code1=0x%llx pc=%p slot=%,
-d",
+        "trace type=%llu code0=0x%llx code1=0x%llx pc=%p slot=%d",
         (unsigned long long)exception,
-        (unsigned    long long)code uint640,
+        (unsigned long long)code0,
         (unsigned long long)code1,
         (void *)(uintptr_t)pc,
         matched_slot
@@ -1113,7 +1112,8 @@ d",
 }
 
 bool brk_arm_function_rva(
-    uintptr_t_t rva,
+    uintptr_t image_base,
+    uint64_t rva,
     void *replacement)
 {
     if (!rva || rva > UINTPTR_MAX - image_base) return false;
