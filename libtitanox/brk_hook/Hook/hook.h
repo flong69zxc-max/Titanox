@@ -30,6 +30,8 @@ int hook_pointer_count(void);
 
 int hook_pointer_slots(void);
 
+int hook_probe(uintptr_t target);
+
 bool brk_install(void *target, void *replacement);
 
 bool brk_observe(void *target);
