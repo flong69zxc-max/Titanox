@@ -21,6 +21,7 @@
 #define HOOK_MAX 64
 #define HOOK_PATCH_SIZE 16
 #define HOOK_TRAMP_SIZE 256
+#define HOOK_TRAMP_NEED 48
 #define HOOK_LOG_LIMIT (1024L * 1024L)
 #define HOOK_NEAR_RANGE (900LL * 1024LL)
 #define HOOK_BRANCH_RANGE (120LL * 1024LL * 1024LL)
@@ -837,6 +838,9 @@ static int hook_emit_block(uintptr_t src, uintptr_t dst, const uint32_t *in, uin
 }
 
 static uintptr_t g_cave_cursor = 0;
+static uint64_t g_cave_runs = 0;
+static uint64_t g_cave_rejected = 0;
+static bool g_cave_logged = false;
 
 static bool hook_cave_is_padding(uintptr_t runStart)
 {
@@ -896,7 +900,7 @@ static uintptr_t hook_find_cave_in_region(uintptr_t regionStart, uintptr_t regio
             uint32_t word = 0;
             memcpy(&word, buffer + i, 4);
 
-            if (word != 0) {
+            if (word != 0 && word != 0xD503201Fu) {
                 run = 0;
                 continue;
             }
@@ -904,6 +908,8 @@ static uintptr_t hook_find_cave_in_region(uintptr_t regionStart, uintptr_t regio
             run += 4;
 
             if (run < need) continue;
+
+            g_cave_runs++;
 
             uintptr_t runStart = cursor + i + 4 - run;
             uintptr_t candidate = (runStart + 7) & ~7ULL;
@@ -913,7 +919,7 @@ static uintptr_t hook_find_cave_in_region(uintptr_t regionStart, uintptr_t regio
 
             if ((candidate + avoidSize) > avoid && candidate < (avoid + avoidSize)) continue;
 
-            if (!hook_cave_is_padding(runStart)) continue;
+            if (!hook_cave_is_padding(runStart)) { g_cave_rejected++; continue; }
 
             return candidate;
         }
@@ -962,7 +968,20 @@ static uintptr_t hook_alloc_from_cave(uintptr_t target, size_t size, bool *near)
         cave = hook_find_cave_in_region(floor, regionEnd, size, avoid, 0x1000);
     }
 
-    if (!cave) return 0;
+    if (!cave) {
+        if (!g_cave_logged) {
+            g_cave_logged = true;
+
+            brk_diag_log("cave scan %p-%p need=%llu runs=%llu rejected=%llu",
+                         (void *)regionStart,
+                         (void *)regionEnd,
+                         (unsigned long long)HOOK_TRAMP_NEED,
+                         (unsigned long long)g_cave_runs,
+                         (unsigned long long)g_cave_rejected);
+        }
+
+        return 0;
+    }
 
     g_cave_cursor = cave + size;
 
@@ -979,7 +998,7 @@ static uintptr_t hook_alloc_trampoline(uintptr_t target, size_t size, bool *near
     if (near) *near = false;
     if (fromCave) *fromCave = false;
 
-    uintptr_t cave = hook_alloc_from_cave(target, size, near);
+    uintptr_t cave = hook_alloc_from_cave(target, HOOK_TRAMP_NEED, near);
 
     if (cave) {
         if (fromCave) *fromCave = true;
