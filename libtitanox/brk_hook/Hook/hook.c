@@ -3,6 +3,8 @@
 
 #include <mach/mach.h>
 #include <mach/arm/thread_status.h>
+#include <mach-o/dyld.h>
+#include <dlfcn.h>
 #include <pthread.h>
 #include <sys/sysctl.h>
 #include <stdarg.h>
@@ -20,6 +22,11 @@
 #define BRK_LOG_LIMIT (1024L * 1024L)
 #define BRK_POLL_US 100000
 #define BRK_PAUSED_MAX 64
+
+#define BRK_MSG_EXCEPTION_RAISE 2405
+#define BRK_MSG_EXCEPTION_RAISE_STATE_IDENTITY 2407
+#define BRK_CHAIN_TIMEOUT_MS 500
+#define BRK_STATE_WORDS 1296
 
 typedef struct {
     uintptr_t target;
@@ -46,12 +53,68 @@ static int g_physical_limit = 6;
 static uint32_t g_live_mask = 0;
 static bool g_ready = false;
 
+static exception_mask_t g_prev_mask = 0;
+static mach_port_t g_prev_port = MACH_PORT_NULL;
+static exception_behavior_t g_prev_behavior = 0;
+static thread_state_flavor_t g_prev_flavor = 0;
+static bool g_prev_valid = false;
+static bool g_chain = false;
+static bool g_livecontainer = false;
+static bool g_task_port_disabled = false;
+static uint64_t g_chain_hits = 0;
+static uint64_t g_chain_fails = 0;
+
 static FILE *g_log = NULL;
 static long g_log_bytes = 0;
 static __thread unsigned g_pause_depth = 0;
 static __thread mach_port_t g_pause_port = MACH_PORT_NULL;
 
 static volatile int g_probe_value = 0;
+
+static bool name_marks_host_runtime(const char *name)
+{
+    if (!name) return false;
+
+    static const char *marks[] = {
+        "TweakLoader",
+        "LiveContainer",
+        "LiveContainerShared",
+        "CydiaSubstrate",
+        "libellekit",
+        "SubstrateLoader",
+        NULL
+    };
+
+    for (int i = 0; marks[i]; ++i) {
+        if (strstr(name, marks[i])) return true;
+    }
+
+    return false;
+}
+
+static bool detect_livecontainer(void)
+{
+    uint32_t count = _dyld_image_count();
+
+    if (count > 8192) count = 8192;
+
+    for (uint32_t i = 0; i < count; ++i) {
+        const char *name = _dyld_get_image_name(i);
+        if (name_marks_host_runtime(name)) return true;
+    }
+
+    if (dlsym(RTLD_DEFAULT, "LiveContainerMain") != NULL) return true;
+
+    const char *home = getenv("HOME");
+
+    if (home) {
+        char probe[1024];
+        snprintf(probe, sizeof(probe), "%s/Documents/Tweaks", home);
+        if (access(probe, F_OK) == 0) return true;
+    }
+
+    return false;
+}
 
 static uintptr_t strip_pointer(const void *p)
 {
@@ -412,6 +475,167 @@ static void *sweep_loop(void *arg)
     return NULL;
 }
 
+#pragma pack(push, 4)
+
+typedef struct {
+    mach_msg_header_t Head;
+    mach_msg_body_t body;
+    mach_msg_port_descriptor_t thread;
+    mach_msg_port_descriptor_t task;
+    NDR_record_t NDR;
+    exception_type_t exception;
+    mach_msg_type_number_t codeCnt;
+    int64_t code[2];
+    int flavor;
+    mach_msg_type_number_t old_stateCnt;
+    natural_t old_state[ARM_THREAD_STATE64_COUNT];
+} brk_forward_request_t;
+
+typedef struct {
+    mach_msg_header_t Head;
+    NDR_record_t NDR;
+    kern_return_t RetCode;
+    int flavor;
+    mach_msg_type_number_t new_stateCnt;
+    natural_t new_state[BRK_STATE_WORDS];
+} brk_forward_reply_t;
+
+#pragma pack(pop)
+
+static kern_return_t forward_to_previous(
+    mach_port_t thread,
+    mach_port_t task,
+    exception_type_t exception,
+    mach_exception_data_t code,
+    mach_msg_type_number_t codeCnt,
+    thread_state_t old_state,
+    mach_msg_type_number_t old_stateCnt,
+    thread_state_t new_state,
+    mach_msg_type_number_t *new_stateCnt)
+{
+    if (!g_prev_valid || g_prev_port == MACH_PORT_NULL) return KERN_FAILURE;
+    if (!g_chain) return KERN_FAILURE;
+    if ((g_prev_behavior & ~MACH_EXCEPTION_CODES) != EXCEPTION_STATE_IDENTITY) {
+        return KERN_FAILURE;
+    }
+    if (g_prev_flavor != ARM_THREAD_STATE64) return KERN_FAILURE;
+    if (!old_state || old_stateCnt != ARM_THREAD_STATE64_COUNT) return KERN_FAILURE;
+    if (!new_state || !new_stateCnt) return KERN_FAILURE;
+    if (*new_stateCnt < ARM_THREAD_STATE64_COUNT) return KERN_FAILURE;
+
+    mach_port_t reply = MACH_PORT_NULL;
+
+    kern_return_t kr = mach_port_allocate(
+        mach_task_self(),
+        MACH_PORT_RIGHT_RECEIVE,
+        &reply
+    );
+
+    if (kr != KERN_SUCCESS) return KERN_FAILURE;
+
+    brk_forward_request_t *request = calloc(1, sizeof(brk_forward_request_t));
+    brk_forward_reply_t *reply_buffer = calloc(1, sizeof(brk_forward_reply_t));
+
+    kern_return_t result = KERN_FAILURE;
+
+    if (request && reply_buffer) {
+        request->Head.msgh_bits =
+            MACH_MSGH_BITS(MACH_MSG_TYPE_COPY_SEND, MACH_MSG_TYPE_MAKE_SEND_ONCE) |
+            MACH_MSGH_BITS_COMPLEX;
+        request->Head.msgh_size = (mach_msg_size_t)sizeof(brk_forward_request_t);
+        request->Head.msgh_remote_port = g_prev_port;
+        request->Head.msgh_local_port = reply;
+        request->Head.msgh_id = BRK_MSG_EXCEPTION_RAISE_STATE_IDENTITY;
+
+        request->body.msgh_descriptor_count = 2;
+
+        request->thread.name = thread;
+        request->thread.type = MACH_MSG_PORT_DESCRIPTOR;
+        request->thread.disposition = MACH_MSG_TYPE_COPY_SEND;
+
+        request->task.name = task;
+        request->task.type = MACH_MSG_PORT_DESCRIPTOR;
+        request->task.disposition = MACH_MSG_TYPE_COPY_SEND;
+
+        request->NDR = NDR_record;
+        request->exception = exception;
+        request->codeCnt = codeCnt > 2 ? 2 : codeCnt;
+
+        for (mach_msg_type_number_t i = 0; i < request->codeCnt; ++i) {
+            request->code[i] = code[i];
+        }
+
+        request->flavor = ARM_THREAD_STATE64;
+        request->old_stateCnt = ARM_THREAD_STATE64_COUNT;
+
+        memcpy(
+            request->old_state,
+            old_state,
+            sizeof(natural_t) * ARM_THREAD_STATE64_COUNT
+        );
+
+        mach_msg_return_t mr = mach_msg(
+            &request->Head,
+            MACH_SEND_MSG | MACH_SEND_TIMEOUT,
+            request->Head.msgh_size,
+            0,
+            MACH_PORT_NULL,
+            BRK_CHAIN_TIMEOUT_MS,
+            MACH_PORT_NULL
+        );
+
+        if (mr == MACH_MSG_SUCCESS) {
+            mr = mach_msg(
+                &reply_buffer->Head,
+                MACH_RCV_MSG | MACH_RCV_TIMEOUT,
+                0,
+                (mach_msg_size_t)sizeof(brk_forward_reply_t),
+                reply,
+                BRK_CHAIN_TIMEOUT_MS,
+                MACH_PORT_NULL
+            );
+
+            if (mr == MACH_MSG_SUCCESS &&
+                reply_buffer->RetCode == KERN_SUCCESS) {
+                if (reply_buffer->flavor == ARM_THREAD_STATE64 &&
+                    reply_buffer->new_stateCnt == ARM_THREAD_STATE64_COUNT) {
+                    memcpy(
+                        new_state,
+                        reply_buffer->new_state,
+                        sizeof(natural_t) * ARM_THREAD_STATE64_COUNT
+                    );
+
+                    *new_stateCnt = reply_buffer->new_stateCnt;
+                }
+
+                result = KERN_SUCCESS;
+            }
+        }
+    }
+
+    free(request);
+    free(reply_buffer);
+
+    mach_port_mod_refs(
+        mach_task_self(),
+        reply,
+        MACH_PORT_RIGHT_RECEIVE,
+        -1
+    );
+
+    return result;
+}
+
+static bool same_port_group(
+    exception_mask_t mask,
+    exception_behavior_t behavior,
+    thread_state_flavor_t flavor)
+{
+    return (mask & EXC_MASK_BREAKPOINT) &&
+        behavior == (exception_behavior_t)(EXCEPTION_STATE_IDENTITY | MACH_EXCEPTION_CODES) &&
+        flavor == ARM_THREAD_STATE64;
+}
+
 static void init_once(void)
 {
     int limit = 0;
@@ -428,6 +652,12 @@ static void init_once(void)
 
     if (g_physical_limit > BRK_MAX) g_physical_limit = BRK_MAX;
     if (g_physical_limit < 1) g_physical_limit = 1;
+
+    g_livecontainer = detect_livecontainer();
+
+    const char *optout = getenv("TITANOX_NO_TASK_EXC_PORT");
+
+    if (optout && optout[0] == '1') g_task_port_disabled = true;
 
     exception_mask_t masks[EXC_TYPES_COUNT];
     mach_port_t ports[EXC_TYPES_COUNT];
@@ -451,16 +681,52 @@ static void init_once(void)
     }
 
     for (mach_msg_type_number_t i = 0; i < count; ++i) {
-        if (ports[i] != MACH_PORT_NULL) {
-            brk_diag_log(
-                "existing_task_exception_port port=%u behavior=%d flavor=%d",
-                ports[i],
-                behaviors[i],
-                flavors[i]
-            );
+        if (ports[i] == MACH_PORT_NULL) continue;
 
-            mach_port_deallocate(mach_task_self(), ports[i]);
+        brk_diag_log(
+            "existing_task_exception_port port=%u behavior=%d flavor=%d mask=0x%x",
+            ports[i],
+            behaviors[i],
+            flavors[i],
+            masks[i]
+        );
+
+        if (!g_prev_valid) {
+            g_prev_mask = masks[i];
+            g_prev_port = ports[i];
+            g_prev_behavior = behaviors[i];
+            g_prev_flavor = flavors[i];
+            g_prev_valid = true;
+            continue;
         }
+
+        mach_port_deallocate(mach_task_self(), ports[i]);
+    }
+
+    if (g_prev_valid) {
+        g_chain = same_port_group(
+            g_prev_mask,
+            g_prev_behavior,
+            g_prev_flavor
+        );
+    }
+
+    brk_diag_log(
+        "host_state livecontainer=%d previous_port=%u previous_behavior=%d chained=%d",
+        g_livecontainer ? 1 : 0,
+        (unsigned)g_prev_port,
+        g_prev_behavior,
+        g_chain ? 1 : 0
+    );
+
+    if (g_task_port_disabled) {
+        brk_diag_log("task_exception_port_disabled_by_env");
+        return;
+    }
+
+    if (g_livecontainer && g_prev_valid && !g_chain) {
+        brk_diag_log("task_exception_port_refused_foreign_owner");
+        return;
     }
 
     kr = mach_port_allocate(
@@ -667,6 +933,7 @@ kern_return_t catch_mach_exception_raise_state_identity(
 {
     kern_return_t result = KERN_FAILURE;
     int matched = -1;
+    bool forward = false;
 
     if (exception != EXC_BREAKPOINT ||
         *flavor != ARM_THREAD_STATE64 ||
@@ -713,9 +980,32 @@ kern_return_t catch_mach_exception_raise_state_identity(
             *new_stateCnt = ARM_THREAD_STATE64_COUNT;
             result = KERN_SUCCESS;
         }
+    } else {
+        forward = g_chain && g_prev_valid;
     }
 
     pthread_mutex_unlock(&g_lock);
+
+    if (forward) {
+        kern_return_t kr = forward_to_previous(
+            thread,
+            task,
+            exception,
+            code,
+            codeCnt,
+            old_state,
+            old_stateCnt,
+            new_state,
+            new_stateCnt
+        );
+
+        if (kr == KERN_SUCCESS) {
+            __sync_fetch_and_add(&g_chain_hits, 1);
+            result = KERN_SUCCESS;
+        } else {
+            __sync_fetch_and_add(&g_chain_fails, 1);
+        }
+    }
 
 finish:
     mach_port_deallocate(mach_task_self(), thread);
@@ -1010,8 +1300,11 @@ void brk_log_state(void)
     }
 
     brk_diag_log(
-        "state task_port_owned=%d",
-        task_port_status()
+        "state task_port_owned=%d chained=%d chain_hits=%llu chain_fails=%llu",
+        task_port_status(),
+        g_chain ? 1 : 0,
+        (unsigned long long)g_chain_hits,
+        (unsigned long long)g_chain_fails
     );
 
     pthread_mutex_unlock(&g_lock);
@@ -1102,12 +1395,85 @@ bool brk_arm_function_rva(
     uint64_t rva,
     void *replacement)
 {
-    if (!rva || rva > UINTPTR_MAX - image_base) return false;
+    if (!image_base || !rva || rva > UINTPTR_MAX - image_base) return false;
 
     return brk_install(
         (void *)(image_base + (uintptr_t)rva),
         replacement
     );
+}
+
+bool brk_chain_active(void)
+{
+    initialize();
+    return g_chain;
+}
+
+bool brk_host_is_livecontainer(void)
+{
+    return detect_livecontainer();
+}
+
+mach_port_t brk_previous_port(void)
+{
+    return g_prev_valid ? g_prev_port : MACH_PORT_NULL;
+}
+
+uint64_t brk_chain_counters(uint64_t *fails)
+{
+    if (fails) *fails = g_chain_fails;
+    return g_chain_hits;
+}
+
+void brk_teardown(void)
+{
+    if (!g_ready) return;
+
+    pthread_mutex_lock(&g_lock);
+
+    for (int i = 0; i < BRK_MAX; ++i) {
+        g_entries[i].armed = false;
+        g_entries[i].used = false;
+    }
+
+    sync_locked();
+
+    pthread_mutex_unlock(&g_lock);
+
+    task_set_exception_ports(
+        mach_task_self(),
+        EXC_MASK_BREAKPOINT,
+        MACH_PORT_NULL,
+        EXCEPTION_STATE_IDENTITY | MACH_EXCEPTION_CODES,
+        ARM_THREAD_STATE64
+    );
+
+    if (g_port != MACH_PORT_NULL) {
+        mach_port_deallocate(mach_task_self(), g_port);
+        g_port = MACH_PORT_NULL;
+    }
+
+    g_ready = false;
+
+    if (g_prev_valid && g_prev_port != MACH_PORT_NULL) {
+        kern_return_t kr = task_set_exception_ports(
+            mach_task_self(),
+            g_prev_mask,
+            g_prev_port,
+            g_prev_behavior,
+            g_prev_flavor
+        );
+
+        brk_diag_log(
+            "teardown restored_previous_port=%u kr=%d",
+            (unsigned)g_prev_port,
+            kr
+        );
+
+        mach_port_deallocate(mach_task_self(), g_prev_port);
+        g_prev_port = MACH_PORT_NULL;
+        g_prev_valid = false;
+    }
 }
 
 bool hook(void *oldArr[], void *newArr[], int count)
