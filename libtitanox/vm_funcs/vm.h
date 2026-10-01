@@ -1,7 +1,8 @@
 #pragma once
 
 #include <mach/mach.h>
-//#include <mach/mach_vm.h>
+
+
 #include <mach/message.h>
 #include <Foundation/Foundation.h>
 
@@ -54,16 +55,16 @@ typedef struct {
     mach_msg_type_number_t dataCnt;
 } __Request__mach_vm_write_t;
 
-/*typedef struct {
-    mach_msg_header_t Head;
-    mach_msg_body_t msgh_body;
-    mach_msg_port_descriptor_t src_task;
-    NDR_record_t NDR;
-    mach_vm_address_t target_address;
-    mach_vm_size_t size;
-    mach_vm_address_t src_address;
-    boolean_t copy;
-    vm_inherit_t inheritance;
-} __Request__mach_vm_remap_t;
-*/
+
+
+
+
+
+
+
+
+
+
+
+
 

@@ -48,51 +48,67 @@ intptr_t GetVmAddrSlide(const char* libName) {
 
 #pragma mark - Breakpoint hook
 
-// breakpoint hook with NO orig.
+
+
 + (BOOL)addBreakpointAtAddress:(void *)original withHook:(void *)hook {
     if (!original || !hook) {
         THLog(@"[ERROR] addBreakpointAtAddress: invalid params. original=%p, hook=%p", original, hook);
         return NO;
     }
-    void *origArray[] = { original };
-    void *hookArray[] = { hook };
-    BOOL res = HookWrapper::callHook(origArray, hookArray, 1);
-    if (res) {
-        THLog(@"Added a breakpoint at address: %p", original);
-    } else {
-        THLog(@"Failed to add breakpoint at address: %p. Maybe your hooks exceeded limits or something else...", original);
+    if (!HookWrapper::install(original, hook)) {
+        THLog(@"[ERROR] brk_install failed for %p (slots %d/%d)", original, brk_active_count(), brk_slot_limit());
+        return NO;
     }
-    return res;
+    THLog(@"[BRK] hooked %p -> %p (%d/%d slots)", original, hook, brk_active_count(), brk_slot_limit());
+    return YES;
 }
 
-#pragma mark - remove breakpoint (Only supports new method)
+#pragma mark - remove breakpoint (orig supported)
 
 + (BOOL)removeBreakpointAtAddress:(void *)original {
     if (!original) {
-        THLog(@"[ERROR] invalid param. original=%p", original);
+        THLog(@"[ERROR] removeBreakpointAtAddress: invalid param");
         return NO;
     }
-    void *origArray[] = { original };
-    BOOL res = HookWrapper::callUnHook(origArray, 1);
-    if (res) {
-        THLog(@"[HOOK] Removed breakpoint at address: %p", original);
-    } else {
-        THLog(@"[ERROR] Failed to remove breakpoint at address: %p", original);
+    if (!HookWrapper::remove(original)) {
+        THLog(@"[ERROR] no breakpoint at %p", original);
+        return NO;
     }
-    return res;
+    THLog(@"[BRK] unhooked %p (%d/%d slots)", original, brk_active_count(), brk_slot_limit());
+    return YES;
+}
+
++ (void *)originalPointerForBreakpoint:(void *)original {
+    return original ? HookWrapper::originalPointer(original) : NULL;
+}
+
++ (void)suspendBreakpoints {
+    HookWrapper::suspendSelf();
+}
+
++ (void)resumeBreakpoints {
+    HookWrapper::resumeSelf();
+}
+
++ (BOOL)breakpointSelfTest {
+    return HookWrapper::selfTest() ? YES : NO;
+}
+
++ (int)breakpointSlotLimit {
+    return brk_slot_limit();
 }
 
 + (NSString *)findExecInBundle:(NSString *)libName {
     NSFileManager *fileManager = [NSFileManager defaultManager];
     NSString *mainBundlePath = [[NSBundle mainBundle] bundlePath];
     NSDirectoryEnumerator *enumerator = [fileManager enumeratorAtPath:mainBundlePath];
-    
+
     for (NSString *filePath in enumerator) {
         if ([filePath.lastPathComponent isEqualToString:libName]) {
             return [mainBundlePath stringByAppendingPathComponent:filePath];
         }
     }
-    
+
     return nil;
 }
 
@@ -124,8 +140,9 @@ intptr_t GetVmAddrSlide(const char* libName) {
             @"uint8_t"   : @5
         };
     }
-    
-    // this is weird but i don't know another way for objc...
+
+
+
     switch (typeMap[type].intValue) {
         case 0: MemX::Write<int>(address, [value intValue]); break;
         case 1: MemX::Write<long>(address, [value longValue]); break;
@@ -137,14 +154,17 @@ intptr_t GetVmAddrSlide(const char* libName) {
     }
 }
 
-// note to dumbass self: you can't do void func() {}
-// you have to do void func {} without '()' [objc]
+
+
+
+
 + (void)ClearAddrRanges {
     MemX::ClearAddrRange();
 }
 
 #pragma mark - MemX Virtual Function hooking stuff
-//from -> ../MemX/VMTWrapper.h"
+
+
 + (void *)vmthookCreateWithNewFunction:(void *)newFunc index:(int32_t)index {
     if (!newFunc) {
         THLog(@"[ERROR] vmthookCreateWithNewFunction: ERROR - newFunc is NULL");
@@ -159,7 +179,8 @@ intptr_t GetVmAddrSlide(const char* libName) {
     if (!makehook) {
         THLog(@"[ERROR] vmthookCreateWithNewFunction: Failed to create hook");
     } else {
-        // fixed: was erroneously logging undefined 'hook', should be 'makehook'
+
+
         THLog(@"[Success] vmthookCreateWithNewFunction: Hook created at %p", makehook);
     }
     return makehook;
@@ -297,7 +318,8 @@ intptr_t GetVmAddrSlide(const char* libName) {
         return;
     }
 
-    // resolve the current symbol address before hooking so isFunctionHooked has a valid pointer to check
+
+
     void *symAddr = dlsym(handle, symbol);
     if (!symAddr) {
         THLog(@"Failed to resolve symbol %s before hooking", symbol);
@@ -333,12 +355,12 @@ intptr_t GetVmAddrSlide(const char* libName) {
 
     Method originalMethod = class_getInstanceMethod(targetClass, originalSelector);
     Method swizzledMethod = class_getInstanceMethod(targetClass, swizzledSelector);
-    
+
     BOOL didAddMethod = class_addMethod(targetClass,
                                         originalSelector,
                                         method_getImplementation(swizzledMethod),
                                         method_getTypeEncoding(swizzledMethod));
-    
+
     if (didAddMethod) {
         class_replaceMethod(targetClass,
                             swizzledSelector,
@@ -357,11 +379,11 @@ intptr_t GetVmAddrSlide(const char* libName) {
             oldFunctionPointer:(IMP *)oldFunctionPointer {
 
     Method method = class_getInstanceMethod(targetClass, selector);
-    
+
     if (oldFunctionPointer) {
         *oldFunctionPointer = method_getImplementation(method);
     }
-    
+
     method_setImplementation(method, newFunction);
 }
 
@@ -391,7 +413,8 @@ intptr_t GetVmAddrSlide(const char* libName) {
                    withPatch:(uint8_t*)patch
                        size:(size_t)size {
 
-    // validate address before attempting the patch
+
+
     if (!address) {
         THLog(@"Invalid address.");
         return;
@@ -408,7 +431,8 @@ intptr_t GetVmAddrSlide(const char* libName) {
 
 #pragma mark - isHooked
 
-// needs sym
+
+
 + (BOOL)isFunctionHooked:(const char *)symbol
            withOriginal:(void *)original
              inLibrary:(const char *)libName {
@@ -420,7 +444,8 @@ intptr_t GetVmAddrSlide(const char* libName) {
 
         if (strcmp(info.dli_sname, symbol) == 0 &&
             (!libName || [libPath isEqualToString:[NSString stringWithUTF8String:info.dli_fname]])) {
-            return NO; // Not hooked
+            return NO;
+
         }
     }
     return YES;
@@ -433,29 +458,29 @@ intptr_t GetVmAddrSlide(const char* libName) {
 
     NSString *libNameString = [NSString stringWithUTF8String:libName];
     NSString *libPath = [self findExecInBundle:libNameString];
-    
+
     void *handle = dlopen([libPath UTF8String], RTLD_NOW | RTLD_NOLOAD);
     if (!handle) {
         THLog(@"Failed to open library: %s", libName);
         return;
     }
-    
+
     bool *boolAddress = (bool *)dlsym(handle, symbol);
     if (!boolAddress) {
         THLog(@"Failed to find symbol: %s", symbol);
         dlclose(handle);
         return;
     }
-    
+
     if (![self isSafeToPatchMemoryAtAddress:boolAddress length:sizeof(bool)]) {
         THLog(@"Memory patching aborted: unsafe memory region.");
         dlclose(handle);
         return;
     }
-    
+
     *boolAddress = !*boolAddress;
     THLog(@"Successfully toggled bool %s in library %s to %d", symbol, libName, *boolAddress);
-    
+
     dlclose(handle);
 }
 
@@ -474,7 +499,7 @@ intptr_t GetVmAddrSlide(const char* libName) {
     vm_region_basic_info_data_64_t info;
     mach_msg_type_number_t infoCount = VM_REGION_BASIC_INFO_COUNT_64;
     mach_port_t objectName;
-    
+
     if (vm_region_64(mach_task_self(), &regionStart, &regionSize, VM_REGION_BASIC_INFO_64, (vm_region_info_t)&info, &infoCount, &objectName) != KERN_SUCCESS) {
         THLog(@"Error: Failed to get memory region info.");
         return NO;
@@ -487,7 +512,7 @@ intptr_t GetVmAddrSlide(const char* libName) {
 #pragma mark - B.A & VM.ADDR.SLIDE
 
 + (uint64_t)getBaseAddressOfLibrary:(const char *)libName {
-    return GetBaseAddress(libName); 
+    return GetBaseAddress(libName);
 }
 
 + (intptr_t)getVmAddrSlideOfLibrary:(const char *)libName {

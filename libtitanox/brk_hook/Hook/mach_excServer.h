@@ -1,7 +1,7 @@
 #ifndef	_mach_exc_server_
 #define	_mach_exc_server_
 
-/* Module mach_exc */
+
 
 #include <string.h>
 #include <mach/ndr.h>
@@ -13,7 +13,7 @@
 #include <mach/mig_errors.h>
 #include <mach/port.h>
 
-/* BEGIN VOUCHER CODE */
+
 
 #ifndef KERNEL
 #if defined(__has_include)
@@ -33,15 +33,19 @@ extern boolean_t voucher_mach_msg_set(mach_msg_header_t * msg) __attribute__((we
 #ifdef __cplusplus
 }
 #endif
-#endif // __VOUCHER_FORWARD_TYPE_DECLS__
-#endif // __has_include(<mach/mach_voucher_types.h>)
-#endif // __has_include
-#endif // !KERNEL
+#endif
 
-/* END VOUCHER CODE */
+#endif
+
+#endif
+
+#endif
 
 
-/* BEGIN MIG_STRNCPY_ZEROFILL CODE */
+
+
+
+
 
 #if defined(__has_include)
 #if __has_include(<mach/mig_strncpy_zerofill_support.h>)
@@ -60,11 +64,11 @@ extern int mig_strncpy_zerofill(char * dest, const char * src, int len) __attrib
 #ifdef __cplusplus
 }
 #endif
-#endif /* __MIG_STRNCPY_ZEROFILL_FORWARD_TYPE_DECLS__ */
-#endif /* __has_include(<mach/mig_strncpy_zerofill_support.h>) */
-#endif /* __has_include */
+#endif
+#endif
+#endif
 
-/* END MIG_STRNCPY_ZEROFILL CODE */
+
 
 
 #ifdef AUTOTEST
@@ -76,12 +80,12 @@ typedef struct {
     function_ptr_t  function;
 } function_table_entry;
 typedef function_table_entry   *function_table_t;
-#endif /* FUNCTION_PTR_T */
-#endif /* AUTOTEST */
+#endif
+#endif
 
 #ifndef	mach_exc_MSG_COUNT
 #define	mach_exc_MSG_COUNT	5
-#endif	/* mach_exc_MSG_COUNT */
+#endif
 
 #include <Availability.h>
 #include <mach/std_types.h>
@@ -91,19 +95,19 @@ typedef function_table_entry   *function_table_t;
 
 #ifdef __BeforeMigServerHeader
 __BeforeMigServerHeader
-#endif /* __BeforeMigServerHeader */
+#endif
 
 #ifndef MIG_SERVER_ROUTINE
 #define MIG_SERVER_ROUTINE
 #endif
 
 
-/* Routine mach_exception_raise */
+
 #ifdef	mig_external
 mig_external
 #else
 extern
-#endif	/* mig_external */
+#endif
 MIG_SERVER_ROUTINE
 kern_return_t catch_mach_exception_raise
  (
@@ -115,12 +119,12 @@ kern_return_t catch_mach_exception_raise
   mach_msg_type_number_t codeCnt
   );
 
-/* Routine mach_exception_raise_state */
+
 #ifdef	mig_external
 mig_external
 #else
 extern
-#endif	/* mig_external */
+#endif
 MIG_SERVER_ROUTINE
 kern_return_t catch_mach_exception_raise_state
  (
@@ -135,12 +139,12 @@ kern_return_t catch_mach_exception_raise_state
   mach_msg_type_number_t *new_stateCnt
   );
 
-/* Routine mach_exception_raise_state_identity */
+
 #ifdef	mig_external
 mig_external
 #else
 extern
-#endif	/* mig_external */
+#endif
 MIG_SERVER_ROUTINE
 kern_return_t catch_mach_exception_raise_state_identity
  (
@@ -161,7 +165,7 @@ kern_return_t catch_mach_exception_raise_state_identity
 mig_external
 #else
 extern
-#endif	/* mig_external */
+#endif
 boolean_t mach_exc_server(
                           mach_msg_header_t *InHeadP,
                           mach_msg_header_t *OutHeadP);
@@ -170,23 +174,23 @@ boolean_t mach_exc_server(
 mig_external
 #else
 extern
-#endif	/* mig_external */
+#endif
 mig_routine_t mach_exc_server_routine(
                                       mach_msg_header_t *InHeadP);
 
 
-/* Description of this subsystem, for use in direct RPC */
+
 extern const struct catch_mach_exc_subsystem {
-    mig_server_routine_t	server;	/* Server routine */
-    mach_msg_id_t	start;	/* Min routine number */
-    mach_msg_id_t	end;	/* Max routine number + 1 */
-    unsigned int	maxsize;	/* Max msg size */
-    vm_address_t	reserved;	/* Reserved */
-    struct routine_descriptor	/* Array of routine descriptors */
+    mig_server_routine_t	server;
+    mach_msg_id_t	start;
+    mach_msg_id_t	end;
+    unsigned int	maxsize;
+    vm_address_t	reserved;
+    struct routine_descriptor
     routine[5];
 } catch_mach_exc_subsystem;
 
-/* typedefs for all requests */
+
 
 #ifndef __Request__mach_exc_subsystem__defined
 #define __Request__mach_exc_subsystem__defined
@@ -196,11 +200,11 @@ extern const struct catch_mach_exc_subsystem {
 #endif
 typedef struct {
     mach_msg_header_t Head;
-    /* start of the kernel processed data */
+
     mach_msg_body_t msgh_body;
     mach_msg_port_descriptor_t thread;
     mach_msg_port_descriptor_t task;
-    /* end of the kernel processed data */
+
     NDR_record_t NDR;
     exception_type_t exception;
     mach_msg_type_number_t codeCnt;
@@ -232,11 +236,11 @@ typedef struct {
 #endif
 typedef struct {
     mach_msg_header_t Head;
-    /* start of the kernel processed data */
+
     mach_msg_body_t msgh_body;
     mach_msg_port_descriptor_t thread;
     mach_msg_port_descriptor_t task;
-    /* end of the kernel processed data */
+
     NDR_record_t NDR;
     exception_type_t exception;
     mach_msg_type_number_t codeCnt;
@@ -248,10 +252,10 @@ typedef struct {
 #ifdef  __MigPackStructs
 #pragma pack(pop)
 #endif
-#endif /* !__Request__mach_exc_subsystem__defined */
+#endif
 
 
-/* union of all requests */
+
 
 #ifndef __RequestUnion__catch_mach_exc_subsystem__defined
 #define __RequestUnion__catch_mach_exc_subsystem__defined
@@ -260,8 +264,8 @@ union __RequestUnion__catch_mach_exc_subsystem {
     __Request__mach_exception_raise_state_t Request_mach_exception_raise_state;
     __Request__mach_exception_raise_state_identity_t Request_mach_exception_raise_state_identity;
 };
-#endif /* __RequestUnion__catch_mach_exc_subsystem__defined */
-/* typedefs for all replies */
+#endif
+
 
 #ifndef __Reply__mach_exc_subsystem__defined
 #define __Reply__mach_exc_subsystem__defined
@@ -307,10 +311,10 @@ typedef struct {
 #ifdef  __MigPackStructs
 #pragma pack(pop)
 #endif
-#endif /* !__Reply__mach_exc_subsystem__defined */
+#endif
 
 
-/* union of all replies */
+
 
 #ifndef __ReplyUnion__catch_mach_exc_subsystem__defined
 #define __ReplyUnion__catch_mach_exc_subsystem__defined
@@ -319,7 +323,7 @@ union __ReplyUnion__catch_mach_exc_subsystem {
     __Reply__mach_exception_raise_state_t Reply_mach_exception_raise_state;
     __Reply__mach_exception_raise_state_identity_t Reply_mach_exception_raise_state_identity;
 };
-#endif /* __ReplyUnion__catch_mach_exc_subsystem__defined */
+#endif
 
 #ifndef subsystem_to_name_map_mach_exc
 #define subsystem_to_name_map_mach_exc \
@@ -330,6 +334,6 @@ union __ReplyUnion__catch_mach_exc_subsystem {
 
 #ifdef __AfterMigServerHeader
 __AfterMigServerHeader
-#endif /* __AfterMigServerHeader */
+#endif
 
-#endif	 /* _mach_exc_server_ */
+#endif

@@ -1,4 +1,5 @@
-// https://github.com/Aethereux/MemX
+
+
 #pragma once
 
 #include <cstdint>
@@ -30,11 +31,14 @@ namespace MemX {
         uintptr_t end;
     };
 
-    // https://developer.apple.com/documentation/kernel/mach_header/
+
+
     inline const std::vector<AddrRange>& GetFullAddr() {
         static std::vector<AddrRange> ranges;
-        // we just need to get ranges once
-        // calling over n over is redundant
+
+
+
+
         if (!ranges.empty()) {
             return ranges;
         }
@@ -49,15 +53,18 @@ namespace MemX {
             uint32_t ncmds = 0;
 
             switch (header->magic) {
-                // ncmds -> https://developer.apple.com/documentation/kernel/mach_header/1525650-ncmds
-                //64-bit
+
+
+
+
                 case MH_MAGIC_64: {
                     const auto* hdr = reinterpret_cast<const mach_header_64*>(ptr);
                     cmd = reinterpret_cast<const load_command*>(hdr + 1);
                     ncmds = hdr->ncmds;
                     break;
                 }
-                //32-bit
+
+
                 case MH_MAGIC: {
                     const auto* hdr = reinterpret_cast<const mach_header*>(ptr);
                     cmd = reinterpret_cast<const load_command*>(hdr + 1);
@@ -70,12 +77,16 @@ namespace MemX {
 
             for (uint32_t j = 0; j < ncmds; ++j) {
                 switch (cmd->cmd) {
-                    // https://developer.apple.com/documentation/kernel/segment_command_64
-                    // goes through the load commands
+
+
+
+
                     case LC_SEGMENT_64: {
                         const auto* seg = reinterpret_cast<const segment_command_64*>(cmd);
-                        uintptr_t start = static_cast<uintptr_t>(seg->vmaddr + slide); // ASLR start
-                        uintptr_t end = start + static_cast<uintptr_t>(seg->vmsize); // vmsize is end
+                        uintptr_t start = static_cast<uintptr_t>(seg->vmaddr + slide);
+
+                        uintptr_t end = start + static_cast<uintptr_t>(seg->vmsize);
+
                         ranges.push_back({start, end});
                         break;
                     }
@@ -88,18 +99,23 @@ namespace MemX {
         }
         return ranges;
     }
-    
-    // if in any case some action like closing or loading
-    // new libs occurs in mem space, which messes with addr range
-    // you can clear it to reset addr range
-    // IsValidPointer automatically populates it anyways.
+
+
+
+
+
+
+
+
+
     inline void ClearAddrRange() {
         static std::vector<AddrRange>& ranges = const_cast<std::vector<AddrRange>&>(GetFullAddr());
         if (ranges.empty()) return;
         ranges.clear();
     }
 
-    // better 'IsValidPointer'
+
+
     inline bool IsValidPointer(uintptr_t addr) {
         const auto& ranges = GetFullAddr();
         for (const auto& r : ranges) {

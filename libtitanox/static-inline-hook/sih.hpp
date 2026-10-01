@@ -18,7 +18,7 @@ struct HookBlock {
     uint64_t code_size{0};
     uint64_t patch_size{0};
     uint64_t patch_hash{0};
-    
+
     void* target_replace{nullptr};
 };
 
@@ -33,12 +33,12 @@ public:
     bool deactivate_patch(uint64_t vaddr, const std::string& patch_bytes);
 
 private:
-    static constexpr size_t CODE_PAGE_SIZE = 4096; /* 4 KB */
-    static constexpr size_t DATA_PAGE_SIZE = 4096; /* 4 KB */
-    
+    static constexpr size_t CODE_PAGE_SIZE = 4096;
+    static constexpr size_t DATA_PAGE_SIZE = 4096;
+
     static constexpr const char* HOOK_TEXT_SEGMENT = "__TITANOX_HOOK";
     static constexpr const char* HOOK_DATA_SEGMENT = "__TITANOX_DATA";
-    
+
     static constexpr const char* HOOK_TEXT_SECTION = "__titanox_text";
     static constexpr const char* HOOK_DATA_SECTION = "__titanox_data";
 
@@ -48,13 +48,13 @@ private:
 
     struct segment_command_64* text_segment_{nullptr};
     struct segment_command_64* data_segment_{nullptr};
-    
+
     uint32_t cryptid_{0};
 
     struct MachOInfo {
         uint64_t vm_end{0};
         uint64_t min_section_offset{0};
-        
+
         struct segment_command_64* linkedit_seg{nullptr};
     };
 

@@ -1,1 +1,12 @@
 .DS_Store
+.theos/
+packages/
+derived/
+xcuserdata/
+*.deb
+*.o
+*.dylib
+*.a
+*.log
+*.tmp
+TITANOX_LOGS.txt

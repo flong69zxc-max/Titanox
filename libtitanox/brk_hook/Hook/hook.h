@@ -1,19 +1,28 @@
-// Modified by Euclid Jan G.
-// https://wsfteam.xyz/discord for femboys
-#ifndef hook_h
-#define hook_h
+#ifndef TITANOX_BRK_HOOK_H
+#define TITANOX_BRK_HOOK_H
+
+#include <stdbool.h>
+#include <stdint.h>
 
 #ifdef __cplusplus
 extern "C" {
 #endif
 
-#include <stdbool.h>
+bool hook(void *old[], void *new[], int count);
+bool unhook(void *old[], int count);
 
-bool hook(void *o[], void *n[], int c);
-bool unhook(void *o[], int c);
+bool brk_install(void *target, void *replacement);
+bool brk_remove(void *target);
+void *brk_original_ptr(void *target);
+void brk_suspend_self(void);
+void brk_resume_self(void);
+int brk_active_count(void);
+int brk_slot_limit(void);
+bool brk_selftest(void);
+void brk_log_state(void);
 
 #ifdef __cplusplus
 }
 #endif
 
-#endif /* hook_h */
+#endif

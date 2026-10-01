@@ -163,9 +163,12 @@ kern_return_t TotallyNotVM::read(mach_vm_address_t address, void *buffer, mach_v
 
     __Request__mach_vm_read_t request = {};
 
-    // mach_vm_read reply is a complex message: header + body + OOL descriptor + dataCnt
-    // the ret_code lives in the msgh_id of the error reply or as an MIG trailer field;
-    // for a successful complex reply we read the OOL descriptor directly.
+
+
+
+
+
+
     struct {
         mach_msg_header_t       header;
         mach_msg_body_t         body;
@@ -238,7 +241,8 @@ kern_return_t TotallyNotVM::write(mach_vm_address_t address, const void *data, m
         kern_return_t ret_code;
     } reply = {};
 
-    // OOL descriptor requires MACH_MSGH_BITS_COMPLEX in msgh_bits
+
+
     request.Head.msgh_bits = MACH_MSGH_BITS_COMPLEX |
                               MACH_MSGH_BITS(MACH_MSG_TYPE_COPY_SEND, MACH_MSG_TYPE_MAKE_SEND_ONCE);
     request.Head.msgh_size = sizeof(request);

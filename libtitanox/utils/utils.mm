@@ -3,7 +3,8 @@
 #import <pthread.h>
 #import <sys/utsname.h>
 
-// had to do some caching because apparently this shit was causing some overhead???
+
+
 static NSDateFormatter *sharedFormatter() {
     static NSDateFormatter *fmt;
     static dispatch_once_t onceToken;

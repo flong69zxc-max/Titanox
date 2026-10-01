@@ -1,25 +1,47 @@
-// Copyright (c) 2013, Facebook, Inc.
-// All rights reserved.
-// Redistribution and use in source and binary forms, with or without
-// modification, are permitted provided that the following conditions are met:
-//   * Redistributions of source code must retain the above copyright notice,
-//     this list of conditions and the following disclaimer.
-//   * Redistributions in binary form must reproduce the above copyright notice,
-//     this list of conditions and the following disclaimer in the documentation
-//     and/or other materials provided with the distribution.
-//   * Neither the name Facebook nor the names of its contributors may be used to
-//     endorse or promote products derived from this software without specific
-//     prior written permission.
-// THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
-// AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
-// IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
-// DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE
-// FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
-// DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR
-// SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER
-// CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY,
-// OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
-// OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 #include "fishhook.h"
 
@@ -138,21 +160,21 @@ static void perform_rebinding_with_section(struct rebindings_entry *rebindings,
           if (cur->rebindings[j].replaced != NULL && indirect_symbol_bindings[i] != cur->rebindings[j].replacement)
             *(cur->rebindings[j].replaced) = indirect_symbol_bindings[i];
 
-          /**
-           * 1. Moved the vm protection modifying codes to here to reduce the
-           *    changing scope.
-           * 2. Adding VM_PROT_WRITE mode unconditionally because vm_region
-           *    API on some iOS/Mac reports mismatch vm protection attributes.
-           * -- Lianfu Hao Jun 16th, 2021
-           **/
+
+
+
+
+
+
+
           err = vm_protect (mach_task_self (), (uintptr_t)indirect_symbol_bindings, section->size, 0, VM_PROT_READ | VM_PROT_WRITE | VM_PROT_COPY);
           if (err == KERN_SUCCESS) {
-            /**
-             * Once we failed to change the vm protection, we
-             * MUST NOT continue the following write actions!
-             * iOS 15 has corrected the const segments prot.
-             * -- Lionfore Hao Jun 11th, 2021
-             **/
+
+
+
+
+
+
             indirect_symbol_bindings[i] = cur->rebindings[j].replacement;
           }
           goto symbol_loop;
@@ -196,12 +218,14 @@ static void rebind_symbols_for_image(struct rebindings_entry *rebindings,
     return;
   }
 
-  // Find base symbol/string table addresses
+
+
   uintptr_t linkedit_base = (uintptr_t)slide + linkedit_segment->vmaddr - linkedit_segment->fileoff;
   nlist_t *symtab = (nlist_t *)(linkedit_base + symtab_cmd->symoff);
   char *strtab = (char *)(linkedit_base + symtab_cmd->stroff);
 
-  // Get indirect symbol table (array of uint32_t indices into symbol table)
+
+
   uint32_t *indirect_symtab = (uint32_t *)(linkedit_base + dysymtab_cmd->indirectsymoff);
 
   cur = (uintptr_t)header + sizeof(mach_header_t);
@@ -250,8 +274,10 @@ int rebind_symbols(struct rebinding rebindings[], size_t rebindings_nel) {
   if (retval < 0) {
     return retval;
   }
-  // If this was the first call, register callback for image additions (which is also invoked for
-  // existing images, otherwise, just run on existing images
+
+
+
+
   if (!_rebindings_head->next) {
     _dyld_register_func_for_add_image(_rebind_symbols_for_image);
   } else {
