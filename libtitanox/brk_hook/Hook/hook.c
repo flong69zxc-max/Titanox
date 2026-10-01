@@ -318,10 +318,17 @@ static bool hook_page_set(uintptr_t address, size_t length, vm_prot_t requested,
 
     if (previous) *previous = prot;
 
+    uintptr_t pageStart = address & ~(uintptr_t)0xFFF;
+    uintptr_t pageEnd = (address + length + 0xFFF) & ~(uintptr_t)0xFFF;
+
+    if (pageStart < start) pageStart = start;
+    if (pageEnd > end) pageEnd = end;
+    if (pageEnd <= pageStart) return false;
+
     kern_return_t kr = vm_protect(
         mach_task_self(),
-        (vm_address_t)start,
-        (vm_size_t)(end - start),
+        (vm_address_t)pageStart,
+        (vm_size_t)(pageEnd - pageStart),
         setMaximum ? TRUE : FALSE,
         requested
     );
@@ -369,16 +376,22 @@ static bool hook_page_writable(uintptr_t address, size_t length, vm_prot_t *save
 
     vm_prot_t raised = (vm_prot_t)(maxProt | VM_PROT_READ | VM_PROT_WRITE);
 
-    if (!hook_page_set(start, 1, raised, TRUE, NULL)) {
+    if (!hook_page_set(address, length, raised, TRUE, NULL)) {
         hook_set_error("write: cannot raise maxprot at %p", (void *)start);
         g_fail_count++;
         return false;
     }
 
+    uintptr_t pageStart = address & ~(uintptr_t)0xFFF;
+    uintptr_t pageEnd = (address + length + 0xFFF) & ~(uintptr_t)0xFFF;
+
+    if (pageStart < start) pageStart = start;
+    if (pageEnd > end) pageEnd = end;
+
     kern_return_t kr = vm_protect(
         mach_task_self(),
-        (vm_address_t)start,
-        (vm_size_t)(end - start),
+        (vm_address_t)pageStart,
+        (vm_size_t)(pageEnd - pageStart),
         FALSE,
         (vm_prot_t)(VM_PROT_COPY | VM_PROT_READ | VM_PROT_WRITE)
     );
@@ -389,8 +402,8 @@ static bool hook_page_writable(uintptr_t address, size_t length, vm_prot_t *save
 
     kr = vm_protect(
         mach_task_self(),
-        (vm_address_t)start,
-        (vm_size_t)(end - start),
+        (vm_address_t)pageStart,
+        (vm_size_t)(pageEnd - pageStart),
         FALSE,
         (vm_prot_t)(VM_PROT_READ | VM_PROT_WRITE)
     );
@@ -403,29 +416,16 @@ static bool hook_page_writable(uintptr_t address, size_t length, vm_prot_t *save
     return kr == KERN_SUCCESS;
 }
 
-static bool hook_page_restore(uintptr_t address, vm_prot_t saved)
+static bool hook_page_restore(uintptr_t address, size_t length, vm_prot_t saved)
 {
-    vm_prot_t prot = 0;
-    uintptr_t start = 0;
-    uintptr_t end = 0;
-
-    if (!hook_region_info(address, &prot, &start, &end)) return false;
-
     vm_prot_t target = (vm_prot_t)(saved & ~VM_PROT_WRITE);
 
-    kern_return_t kr = vm_protect(
-        mach_task_self(),
-        (vm_address_t)start,
-        (vm_size_t)(end - start),
-        FALSE,
-        target
-    );
-
-    if (kr != KERN_SUCCESS) {
-        hook_set_error("restore: failed at %p kr=%d", (void *)start, kr);
+    if (!hook_page_set(address, length, target, FALSE, NULL)) {
+        hook_set_error("restore: failed at %p", (void *)address);
+        return false;
     }
 
-    return kr == KERN_SUCCESS;
+    return true;
 }
 
 static bool hook_page_executable(uintptr_t address, size_t length)
@@ -534,7 +534,7 @@ static bool hook_write_bytes(uintptr_t address, const void *data, size_t length)
 
     memcpy((void *)address, data, length);
 
-    hook_page_restore(address, saved);
+    hook_page_restore(address, length, saved);
 
     sys_icache_invalidate((void *)address, length);
 
@@ -1137,10 +1137,21 @@ static bool hook_write_u64(uintptr_t address, uintptr_t value)
         vm_prot_t maxProt = 0;
 
         if (!hook_region_maxprot(address, &maxProt)) return false;
-        if ((maxProt & VM_PROT_WRITE) == 0) return false;
 
-        if (!hook_page_set(start, 1, (vm_prot_t)(maxProt | VM_PROT_READ | VM_PROT_WRITE), TRUE, NULL)) return false;
-        if (!hook_page_set(start, 1, (vm_prot_t)(prot | VM_PROT_READ | VM_PROT_WRITE), FALSE, NULL)) return false;
+        if ((maxProt & VM_PROT_WRITE) == 0) {
+            hook_set_error("data write: maxprot at %p has no WRITE", (void *)address);
+            return false;
+        }
+
+        if (!hook_page_set(address, 8, (vm_prot_t)(maxProt | VM_PROT_READ | VM_PROT_WRITE), TRUE, NULL)) {
+            hook_set_error("data write: cannot raise maxprot at %p", (void *)address);
+            return false;
+        }
+
+        if (!hook_page_set(address, 8, (vm_prot_t)(prot | VM_PROT_READ | VM_PROT_WRITE), FALSE, NULL)) {
+            hook_set_error("data write: page %p stays read-only", (void *)address);
+            return false;
+        }
 
         restore = true;
     }
@@ -1148,7 +1159,7 @@ static bool hook_write_u64(uintptr_t address, uintptr_t value)
     memcpy((void *)address, &value, 8);
 
     if (restore) {
-        hook_page_set(start, 1, savedProt, FALSE, NULL);
+        hook_page_set(address, 8, savedProt, FALSE, NULL);
     }
 
     uintptr_t check = 0;
@@ -1162,13 +1173,94 @@ static uint64_t g_scan_segments = 0;
 static uint64_t g_scan_bytes = 0;
 static uint64_t g_scan_values = 0;
 static uint64_t g_scan_matches = 0;
+static uint64_t g_scan_offsets = 0;
 static uint64_t g_scan_slots_used = 0;
-static bool g_scan_segments_logged = false;
+
+typedef struct {
+    int mode;
+    int key;
+    unsigned div;
+} hook_slot_fix_t;
+
+static int hook_slot_classify(uintptr_t value, uintptr_t needle, uintptr_t imageBase,
+                              uintptr_t slot, hook_slot_fix_t *out)
+{
+    if (out) {
+        out->mode = 0;
+        out->key = 0;
+        out->div = 0;
+    }
+
+    if (!needle) return 0;
+
+    if (value == needle) {
+        if (out) out->mode = 1;
+        return 1;
+    }
+
+    if ((value & HOOK_VA_LIMIT) == needle) {
+#if __has_feature(ptrauth_calls)
+        unsigned divs[2];
+        divs[0] = (unsigned)(slot & 0xFFFFu);
+        divs[1] = 0;
+
+        for (int d = 0; d < 2; d++) {
+            for (int k = 0; k < 4; k++) {
+                void *signedProbe = ptrauth_sign_unauthenticated(
+                    (void *)needle, (ptrauth_key)k, (ptrauth_extra_data_t)divs[d]);
+
+                if ((uintptr_t)signedProbe != value) continue;
+
+                if (out) {
+                    out->mode = 2;
+                    out->key = k;
+                    out->div = divs[d];
+                }
+
+                return 2;
+            }
+        }
+#else
+        (void)slot;
+#endif
+
+        return 0;
+    }
+
+    if (imageBase && needle > imageBase) {
+        uintptr_t offset = needle - imageBase;
+
+        if ((value >> 43) == 0 && (value & 0x7FFFFFFFFFFULL) == offset) {
+            if (out) out->mode = 3;
+            return 3;
+        }
+    }
+
+    return 0;
+}
+
+static uintptr_t hook_slot_encode(uintptr_t replacement, const hook_slot_fix_t *fix)
+{
+    if (!fix || fix->mode != 2) return replacement;
+
+#if __has_feature(ptrauth_calls)
+    return (uintptr_t)ptrauth_sign_unauthenticated(
+        (void *)replacement, (ptrauth_key)fix->key, (ptrauth_extra_data_t)fix->div);
+#else
+    return replacement;
+#endif
+}
 
 static int hook_scan_tables_value(uintptr_t imageBase, uintptr_t needle, uintptr_t replacement,
                                   uintptr_t *slots, int capacity, bool dryRun, const char *label)
 {
     if (!imageBase || !needle || !slots || capacity <= 0) return 0;
+
+    g_scan_segments = 0;
+    g_scan_bytes = 0;
+    g_scan_values = 0;
+    g_scan_matches = 0;
+    g_scan_offsets = 0;
 
     const struct mach_header_64 *header = (const struct mach_header_64 *)imageBase;
 
@@ -1225,20 +1317,21 @@ static int hook_scan_tables_value(uintptr_t imageBase, uintptr_t needle, uintptr
 
         const struct segment_command_64 *seg = (const struct segment_command_64 *)cmd;
 
-        if ((seg->initprot & VM_PROT_WRITE) == 0) { cursor += cmd->cmdsize; continue; }
         if (seg->initprot & VM_PROT_EXECUTE) { cursor += cmd->cmdsize; continue; }
+        if (((seg->initprot | seg->maxprot) & VM_PROT_WRITE) == 0) { cursor += cmd->cmdsize; continue; }
 
         uintptr_t start = (uintptr_t)seg->vmaddr + slide;
         uintptr_t end = start + (uintptr_t)seg->vmsize;
 
-        if (!g_scan_segments_logged && segments < 16) {
-            brk_diag_log("scan %s seg %s %p-%p size=%llu initprot=%d",
+        if (segments < 24) {
+            brk_diag_log("scan %s seg %s %p-%p size=%llu initprot=%d maxprot=%d",
                          label ? label : "?",
                          seg->segname,
                          (void *)start,
                          (void *)end,
                          (unsigned long long)seg->vmsize,
-                         (int)seg->initprot);
+                         (int)seg->initprot,
+                         (int)seg->maxprot);
         }
 
         segments++;
@@ -1259,36 +1352,47 @@ static int hook_scan_tables_value(uintptr_t imageBase, uintptr_t needle, uintptr
 
                 g_scan_values++;
 
-                if (value != needle) continue;
+                uintptr_t slot = p + i;
+                hook_slot_fix_t fix;
+
+                int mode = hook_slot_classify(value, needle, imageBase, slot, &fix);
+
+                if (mode == 0) continue;
+
+                if (mode == 3) {
+                    g_scan_offsets++;
+                    continue;
+                }
 
                 g_scan_matches++;
 
                 if (hits >= capacity) continue;
 
-                uintptr_t slot = p + i;
-
                 if (dryRun) {
                     slots[hits] = slot;
                     hits++;
 
-                    brk_diag_log("scan %s dry-run slot %p in %s holds %p",
+                    brk_diag_log("scan %s dry-run slot %p in %s holds %p mode=%d",
                                  label ? label : "?",
                                  (void *)slot,
                                  seg->segname,
-                                 (void *)needle);
+                                 (void *)value,
+                                 mode);
 
                     continue;
                 }
 
-                if (!hook_write_u64(slot, replacement)) continue;
+                uintptr_t writeValue = hook_slot_encode(replacement, &fix);
+
+                if (!hook_write_u64(slot, writeValue)) continue;
 
                 slots[hits] = slot;
                 hits++;
                 g_scan_slots_used++;
 
-                brk_diag_log("pointer slot %p in %s referenced %p -> %p",
+                brk_diag_log("pointer slot %p in %s referenced %p -> %p mode=%d",
                              (void *)slot, seg->segname,
-                             (void *)needle, (void *)replacement);
+                             (void *)needle, (void *)writeValue, mode);
             }
 
             p += want;
@@ -1331,36 +1435,25 @@ static int hook_pointer_install(uintptr_t target, uintptr_t replacement)
     }
 
     uintptr_t slots[HOOK_PTR_SLOTS];
+
     int hits = hook_scan_tables_value(imageBase, target, replacement, slots, HOOK_PTR_SLOTS, false, "addr");
 
-    int offsetHits = 0;
-    uintptr_t offsetSlots[HOOK_PTR_SLOTS];
+    uint64_t offsets = g_scan_offsets;
 
-    if (hits <= 0 && target > imageBase) {
-        offsetHits = hook_scan_tables_value(imageBase, target - imageBase, 0,
-                                            offsetSlots, HOOK_PTR_SLOTS, true, "offset");
-    }
-
-    brk_diag_log("pointer scan target=%p image=%p addr_hits=%d offset_hits=%d segments=%llu bytes=%llu values=%llu matches=%llu",
+    brk_diag_log("pointer scan target=%p image=%p addr_hits=%d offset_only=%llu segments=%llu bytes=%llu values=%llu matches=%llu",
                  (void *)target,
                  (void *)imageBase,
                  hits,
-                 offsetHits,
+                 (unsigned long long)offsets,
                  (unsigned long long)g_scan_segments,
                  (unsigned long long)g_scan_bytes,
                  (unsigned long long)g_scan_values,
                  (unsigned long long)g_scan_matches);
 
-    g_scan_segments = 0;
-    g_scan_bytes = 0;
-    g_scan_values = 0;
-    g_scan_matches = 0;
-    g_scan_segments_logged = true;
-
     if (hits <= 0) {
-        if (offsetHits > 0) {
-            hook_set_error("pointer hook: %p not stored as VA, but %d unslid-offset slot(s) found (dry run)",
-                           (void *)target, offsetHits);
+        if (offsets > 0) {
+            hook_set_error("pointer hook: %p not stored as VA, %llu unslid-offset slot(s) found",
+                           (void *)target, (unsigned long long)offsets);
         } else {
             hook_set_error("pointer hook: no writable slot references %p", (void *)target);
         }
@@ -1418,16 +1511,20 @@ int hook_probe(uintptr_t target)
 
     if (!imageBase) return -1;
 
-    uint64_t before = g_scan_matches;
     uintptr_t slots[HOOK_PTR_SLOTS];
 
-    hook_scan_tables_value(imageBase, target, 0, slots, HOOK_PTR_SLOTS, true, "probe");
+    int hits = hook_scan_tables_value(imageBase, target, 0, slots, HOOK_PTR_SLOTS, true, "probe");
 
-    uint64_t found = g_scan_matches - before;
+    brk_diag_log("probe target=%p image=%p slots=%d offset_only=%llu segments=%llu bytes=%llu values=%llu",
+                 (void *)target,
+                 (void *)imageBase,
+                 hits,
+                 (unsigned long long)g_scan_offsets,
+                 (unsigned long long)g_scan_segments,
+                 (unsigned long long)g_scan_bytes,
+                 (unsigned long long)g_scan_values);
 
-    if (found > 0x7FFFFFFFULL) found = 0x7FFFFFFFULL;
-
-    return (int)found;
+    return hits;
 }
 
 bool brk_install(void *target, void *replacement)
