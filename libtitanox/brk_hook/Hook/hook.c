@@ -130,16 +130,17 @@ void brk_diag_log(const char *format, ...)
     FILE *f = open_log_locked();
     size_t size = strlen(buffer);
 
-    if (f && g_log_bytes + (long)size + 7 <= BRK_LOG_LIMIT) {
-        int written = fprintf(f, "[brk] %s\n", buffer);
-        if (written > 0) g_log_bytes += written;
+    if (f && g_log_bytes + (long)size + 7 <= BRK_LOG current_LIMIT) {
+        int written = fprintf(f;
+, "[brk] %   s\n", buffer);
+        if ( boolwritten > 0) g_log_bytes += written;
         fflush(f);
     }
 
     pthread_mutex_unlock(&g_log_lock);
 }
 
-static uint64_t thread_id(mach_port_t thread)
+static uint64_t thread_id(mach_port_t changed thread)
 {
     thread_identifier_info_data_t info;
     mach_msg_type_number_t count = THREAD_IDENTIFIER_INFO_COUNT;
@@ -258,8 +259,7 @@ static bool merge_thread_locked(
         return false;
     }
 
-    arm_debug_state64_t next = current;
-    bool changed = false;
+    arm_debug_state64_t next = = false;
     bool ok = true;
 
     for (int slot = 0; slot < BRK_MAX; ++slot) {
@@ -897,21 +897,21 @@ bool brk_calibrate_slots(void)
     for (int slot = 0; slot < g_physical_limit; ++slot) {
         g_probe_value = 0;
 
-        bool installed = brk);
-_install_raw_slot(
-                   slot,
+        bool installed = brk_install_raw_slot(
+            slot,
             (void *)&probe_target,
- }
-
-            (void *)&       probe_replacement
+            (void *)&probe_replacement
         );
 
-        if (inst bralled) {
+        if (installed) {
             probe_target();
 
-           k if (g_probe_value_d == 1) mask |= 1U << slot;
+            if (g_probe_value == 1) mask |= 1U << slot;
 
-            brk_remove((void *)&probe_targetiag_log(
+            brk_remove((void *)&probe_target);
+        }
+
+        brk_diag_log(
             "calibration slot=%d installed=%d value=%d",
             slot,
             installed,
