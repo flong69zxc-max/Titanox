@@ -580,7 +580,7 @@ static int hook_emit_one(uint32_t insn, uintptr_t src, uintptr_t dst, uint8_t *o
         return hook_emit_movabs(out, (uint32_t)(insn & 0x1Fu), (uint64_t)((int64_t)src + imm));
     }
 
-    if ((insn & 0x7C000000u) == 0x14000000u) {
+    if ((insn & 0xFC000000u) == 0x14000000u) {
         if (hook_reloc_branch26(insn, src, dst, &word)) {
             hook_put32(out, 0, word);
             hook_put32(out, 4, HOOK_OP_NOP);
@@ -591,7 +591,7 @@ static int hook_emit_one(uint32_t insn, uintptr_t src, uintptr_t dst, uint8_t *o
         return hook_emit_abs_jump(out, (uintptr_t)((int64_t)src + (imm26 << 2)), false);
     }
 
-    if ((insn & 0x7C000000u) == 0x94000000u) {
+    if ((insn & 0xFC000000u) == 0x94000000u) {
         if (hook_reloc_branch26(insn, src, dst, &word)) {
             hook_put32(out, 0, word);
             hook_put32(out, 4, HOOK_OP_NOP);
@@ -696,13 +696,13 @@ static uintptr_t hook_alloc_trampoline(uintptr_t target, size_t size, bool *near
 
     for (int64_t step = 0x10000; step <= (int64_t)HOOK_NEAR_RANGE; step += 0x10000) {
         for (int dir = 0; dir < 2; dir++) {
-            mach_vm_address_t candidate =
-                dir ? (mach_vm_address_t)(page + (uintptr_t)step)
-                    : (mach_vm_address_t)(page - (uintptr_t)step);
+            vm_address_t candidate =
+                dir ? (vm_address_t)(page + (uintptr_t)step)
+                    : (vm_address_t)(page - (uintptr_t)step);
 
             if (candidate < 0x100000000ULL) continue;
 
-            kern_return_t kr = mach_vm_allocate(mach_task_self(), &candidate, size, 0);
+            kern_return_t kr = vm_allocate(mach_task_self(), &candidate, size, 0);
             if (kr != KERN_SUCCESS) continue;
 
             vm_protect(mach_task_self(), candidate, size, FALSE,
@@ -857,7 +857,7 @@ bool brk_install(void *target, void *replacement)
                                     HOOK_TRAMP_SIZE - HOOK_PATCH_SIZE);
 
     if (blockSize <= 0) {
-        mach_vm_deallocate(mach_task_self(), (mach_vm_address_t)tramp, HOOK_TRAMP_SIZE);
+        vm_deallocate(mach_task_self(), (vm_address_t)tramp, (vm_size_t)HOOK_TRAMP_SIZE);
         entry->used = false;
         pthread_mutex_unlock(&g_lock);
         hook_set_error("install: trampoline emission failed at %p", (void *)addr);
@@ -880,7 +880,7 @@ bool brk_install(void *target, void *replacement)
     hook_build_patch(repl, patch);
 
     if (!hook_write_bytes(addr, patch, HOOK_PATCH_SIZE)) {
-        mach_vm_deallocate(mach_task_self(), (mach_vm_address_t)tramp, HOOK_TRAMP_SIZE);
+        vm_deallocate(mach_task_self(), (vm_address_t)tramp, (vm_size_t)HOOK_TRAMP_SIZE);
         entry->used = false;
         pthread_mutex_unlock(&g_lock);
         hook_set_error("install: patch write failed at %p", (void *)addr);
@@ -948,7 +948,7 @@ bool brk_remove(void *target)
     bool restored = hook_write_bytes(entry->target, entry->saved, HOOK_PATCH_SIZE);
 
     if (entry->tramp) {
-        mach_vm_deallocate(mach_task_self(), (mach_vm_address_t)entry->tramp, HOOK_TRAMP_SIZE);
+        vm_deallocate(mach_task_self(), (vm_address_t)entry->tramp, (vm_size_t)HOOK_TRAMP_SIZE);
     }
 
     memset(entry, 0, sizeof(hook_entry_t));
@@ -1308,9 +1308,9 @@ void brk_teardown(void)
         }
 
         if (g_hooks[i].tramp) {
-            mach_vm_deallocate(mach_task_self(),
-                               (mach_vm_address_t)g_hooks[i].tramp,
-                               HOOK_TRAMP_SIZE);
+            vm_deallocate(mach_task_self(),
+                          (vm_address_t)g_hooks[i].tramp,
+                          (vm_size_t)HOOK_TRAMP_SIZE);
         }
 
         memset(&g_hooks[i], 0, sizeof(hook_entry_t));
