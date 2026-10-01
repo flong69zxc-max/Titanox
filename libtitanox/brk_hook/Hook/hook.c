@@ -329,6 +329,8 @@ static bool hook_page_set(uintptr_t address, size_t length, vm_prot_t requested,
     return kr == KERN_SUCCESS;
 }
 
+bool hook_code_patch_allowed(void);
+
 static bool hook_page_writable(uintptr_t address, size_t length, vm_prot_t *saved)
 {
     vm_prot_t prot = 0;
@@ -337,6 +339,12 @@ static bool hook_page_writable(uintptr_t address, size_t length, vm_prot_t *save
 
     if (!hook_region_info(address, &prot, &start, &end)) return false;
     if ((address + length) > end) return false;
+
+    if ((prot & VM_PROT_EXECUTE) && !hook_code_patch_allowed()) {
+        hook_set_error("write: refusing executable page at %p (code patching disabled)", (void *)start);
+        g_fail_count++;
+        return false;
+    }
 
     if (saved) *saved = prot;
 
@@ -1013,6 +1021,321 @@ static void hook_build_patch(uintptr_t replacement, uint8_t *out)
     hook_put32(out, 12, (uint32_t)((replacement >> 32) & 0xFFFFFFFFu));
 }
 
+#define HOOK_PTR_ENTRIES 16
+#define HOOK_PTR_SLOTS 32
+
+typedef struct {
+    uintptr_t target;
+    uintptr_t replacement;
+    uintptr_t slots[HOOK_PTR_SLOTS];
+    int count;
+    bool used;
+} hook_ptr_entry_t;
+
+static hook_ptr_entry_t g_ptr_hooks[HOOK_PTR_ENTRIES];
+static uint64_t g_ptr_writes = 0;
+
+bool hook_code_patch_allowed(void)
+{
+    const char *flag = getenv("TITANOX_ALLOW_CODE_PATCH");
+
+    if (!flag) return false;
+    if (flag[0] == '0') return false;
+
+    return true;
+}
+
+static uintptr_t hook_image_base_for(uintptr_t address)
+{
+    uint32_t count = _dyld_image_count();
+    if (count > 8192) count = 8192;
+
+    for (uint32_t i = 0; i < count; i++) {
+        uintptr_t base = (uintptr_t)_dyld_get_image_header(i);
+        if (!base || address < base) continue;
+
+        const struct mach_header_64 *header = (const struct mach_header_64 *)base;
+
+        if (header->magic != MH_MAGIC_64) continue;
+        if (header->ncmds == 0 || header->ncmds > 4096) continue;
+        if (header->sizeofcmds == 0 || header->sizeofcmds > (4u * 1024u * 1024u)) continue;
+
+        const uint8_t *cursor = (const uint8_t *)(header + 1);
+        const uint8_t *limit = cursor + header->sizeofcmds;
+        uintptr_t textVmaddr = 0;
+        bool haveText = false;
+
+        for (uint32_t c = 0; c < header->ncmds; c++) {
+            if (cursor + sizeof(struct load_command) > limit) break;
+
+            const struct load_command *cmd = (const struct load_command *)cursor;
+
+            if (cmd->cmdsize < sizeof(struct load_command)) break;
+            if (cursor + cmd->cmdsize > limit) break;
+
+            if (cmd->cmd == LC_SEGMENT_64 && cmd->cmdsize >= sizeof(struct segment_command_64)) {
+                const struct segment_command_64 *seg = (const struct segment_command_64 *)cmd;
+                if (strcmp(seg->segname, "__TEXT") == 0) {
+                    textVmaddr = (uintptr_t)seg->vmaddr;
+                    haveText = true;
+                    break;
+                }
+            }
+
+            cursor += cmd->cmdsize;
+        }
+
+        if (!haveText) continue;
+
+        uintptr_t slide = base - textVmaddr;
+
+        cursor = (const uint8_t *)(header + 1);
+
+        for (uint32_t c = 0; c < header->ncmds; c++) {
+            if (cursor + sizeof(struct load_command) > limit) break;
+
+            const struct load_command *cmd = (const struct load_command *)cursor;
+
+            if (cmd->cmdsize < sizeof(struct load_command)) break;
+            if (cursor + cmd->cmdsize > limit) break;
+
+            if (cmd->cmd == LC_SEGMENT_64 && cmd->cmdsize >= sizeof(struct segment_command_64)) {
+                const struct segment_command_64 *seg = (const struct segment_command_64 *)cmd;
+                uintptr_t start = (uintptr_t)seg->vmaddr + slide;
+                uintptr_t end = start + (uintptr_t)seg->vmsize;
+
+                if (address >= start && address < end) return base;
+            }
+
+            cursor += cmd->cmdsize;
+        }
+    }
+
+    return 0;
+}
+
+static bool hook_write_u64(uintptr_t address, uintptr_t value)
+{
+    vm_prot_t prot = 0;
+    uintptr_t start = 0;
+    uintptr_t end = 0;
+
+    if (!hook_region_info(address, &prot, &start, &end)) return false;
+    if ((address + 8) > end) return false;
+
+    if (prot & VM_PROT_EXECUTE) {
+        hook_set_error("data write: refusing executable page at %p", (void *)start);
+        return false;
+    }
+
+    bool restore = false;
+    vm_prot_t savedProt = prot;
+
+    if ((prot & VM_PROT_WRITE) == 0) {
+        vm_prot_t maxProt = 0;
+
+        if (!hook_region_maxprot(address, &maxProt)) return false;
+        if ((maxProt & VM_PROT_WRITE) == 0) return false;
+
+        if (!hook_page_set(start, 1, (vm_prot_t)(maxProt | VM_PROT_READ | VM_PROT_WRITE), TRUE, NULL)) return false;
+        if (!hook_page_set(start, 1, (vm_prot_t)(prot | VM_PROT_READ | VM_PROT_WRITE), FALSE, NULL)) return false;
+
+        restore = true;
+    }
+
+    memcpy((void *)address, &value, 8);
+
+    if (restore) {
+        hook_page_set(start, 1, savedProt, FALSE, NULL);
+    }
+
+    uintptr_t check = 0;
+
+    if (!hook_read_bytes(address, &check, 8)) return false;
+
+    return check == value;
+}
+
+static int hook_scan_tables(uintptr_t imageBase, uintptr_t target, uintptr_t replacement,
+                            uintptr_t *slots, int capacity)
+{
+    if (!imageBase || !target || !slots || capacity <= 0) return 0;
+
+    const struct mach_header_64 *header = (const struct mach_header_64 *)imageBase;
+
+    if (header->magic != MH_MAGIC_64) return 0;
+    if (header->ncmds == 0 || header->ncmds > 4096) return 0;
+    if (header->sizeofcmds == 0 || header->sizeofcmds > (4u * 1024u * 1024u)) return 0;
+
+    const uint8_t *cursor = (const uint8_t *)(header + 1);
+    const uint8_t *limit = cursor + header->sizeofcmds;
+    uintptr_t textVmaddr = 0;
+    bool haveText = false;
+
+    for (uint32_t c = 0; c < header->ncmds; c++) {
+        if (cursor + sizeof(struct load_command) > limit) break;
+
+        const struct load_command *cmd = (const struct load_command *)cursor;
+
+        if (cmd->cmdsize < sizeof(struct load_command)) break;
+        if (cursor + cmd->cmdsize > limit) break;
+
+        if (cmd->cmd == LC_SEGMENT_64 && cmd->cmdsize >= sizeof(struct segment_command_64)) {
+            const struct segment_command_64 *seg = (const struct segment_command_64 *)cmd;
+            if (strcmp(seg->segname, "__TEXT") == 0) {
+                textVmaddr = (uintptr_t)seg->vmaddr;
+                haveText = true;
+                break;
+            }
+        }
+
+        cursor += cmd->cmdsize;
+    }
+
+    if (!haveText) return 0;
+
+    uintptr_t slide = imageBase - textVmaddr;
+    uint8_t buffer[4096];
+    int hits = 0;
+
+    cursor = (const uint8_t *)(header + 1);
+
+    for (uint32_t c = 0; c < header->ncmds && hits < capacity; c++) {
+        if (cursor + sizeof(struct load_command) > limit) break;
+
+        const struct load_command *cmd = (const struct load_command *)cursor;
+
+        if (cmd->cmdsize < sizeof(struct load_command)) break;
+        if (cursor + cmd->cmdsize > limit) break;
+
+        if (cmd->cmd != LC_SEGMENT_64 || cmd->cmdsize < sizeof(struct segment_command_64)) {
+            cursor += cmd->cmdsize;
+            continue;
+        }
+
+        const struct segment_command_64 *seg = (const struct segment_command_64 *)cmd;
+
+        if ((seg->initprot & VM_PROT_WRITE) == 0) { cursor += cmd->cmdsize; continue; }
+        if (seg->initprot & VM_PROT_EXECUTE) { cursor += cmd->cmdsize; continue; }
+
+        uintptr_t start = (uintptr_t)seg->vmaddr + slide;
+        uintptr_t end = start + (uintptr_t)seg->vmsize;
+
+        for (uintptr_t p = start; (p + 8) <= end && hits < capacity; ) {
+            size_t want = sizeof(buffer);
+            if ((p + want) > end) want = (size_t)(end - p);
+            if (want < 8) break;
+
+            if (!hook_read_bytes(p, buffer, want)) { p += 0x1000; continue; }
+
+            for (size_t i = 0; (i + 8) <= want; i += 8) {
+                uintptr_t value = 0;
+                memcpy(&value, buffer + i, 8);
+
+                if (value != target) continue;
+
+                uintptr_t slot = p + i;
+
+                if (!hook_write_u64(slot, replacement)) continue;
+
+                slots[hits] = slot;
+                hits++;
+
+                brk_diag_log("pointer slot %p referenced %p -> %p",
+                             (void *)slot, (void *)target, (void *)replacement);
+
+                if (hits >= capacity) break;
+            }
+
+            p += want;
+
+            if (want == 0) break;
+        }
+
+        cursor += cmd->cmdsize;
+    }
+
+    return hits;
+}
+
+static int hook_pointer_install(uintptr_t target, uintptr_t replacement)
+{
+    hook_ptr_entry_t *entry = hook_pointer_find(target);
+
+    if (!entry) {
+        for (int i = 0; i < HOOK_PTR_ENTRIES; i++) {
+            if (!g_ptr_hooks[i].used) {
+                memset(&g_ptr_hooks[i], 0, sizeof(hook_ptr_entry_t));
+                g_ptr_hooks[i].used = true;
+                g_ptr_hooks[i].target = target;
+                entry = &g_ptr_hooks[i];
+                break;
+            }
+        }
+    }
+
+    if (!entry) {
+        hook_set_error("pointer hook table exhausted (%d)", HOOK_PTR_ENTRIES);
+        return 0;
+    }
+
+    uintptr_t imageBase = hook_image_base_for(target);
+
+    if (!imageBase) {
+        hook_set_error("pointer hook: no image owns %p", (void *)target);
+        return 0;
+    }
+
+    uintptr_t slots[HOOK_PTR_SLOTS];
+    int hits = hook_scan_tables(imageBase, target, replacement, slots, HOOK_PTR_SLOTS);
+
+    if (hits <= 0) {
+        hook_set_error("pointer hook: no writable slot references %p", (void *)target);
+        return 0;
+    }
+
+    for (int i = 0; i < hits && entry->count < HOOK_PTR_SLOTS; i++) {
+        entry->slots[entry->count] = slots[i];
+        entry->count++;
+    }
+
+    entry->replacement = replacement;
+    g_ptr_writes += (uint64_t)hits;
+
+    return hits;
+}
+
+static hook_ptr_entry_t *hook_pointer_find(uintptr_t target)
+{
+    for (int i = 0; i < HOOK_PTR_ENTRIES; i++) {
+        if (g_ptr_hooks[i].used && g_ptr_hooks[i].target == target) return &g_ptr_hooks[i];
+    }
+
+    return NULL;
+}
+
+int hook_pointer_count(void)
+{
+    int total = 0;
+
+    for (int i = 0; i < HOOK_PTR_ENTRIES; i++) {
+        if (g_ptr_hooks[i].used) total++;
+    }
+
+    return total;
+}
+
+int hook_pointer_slots(void)
+{
+    int total = 0;
+
+    for (int i = 0; i < HOOK_PTR_ENTRIES; i++) {
+        if (g_ptr_hooks[i].used) total += g_ptr_hooks[i].count;
+    }
+
+    return total;
+}
+
 bool brk_install(void *target, void *replacement)
 {
     if (!target || !replacement) {
@@ -1044,6 +1367,23 @@ bool brk_install(void *target, void *replacement)
 
     if ((prot & VM_PROT_EXECUTE) == 0) {
         hook_set_error("install: target %p not executable (prot=%d)", (void *)addr, (int)prot);
+        g_fail_count++;
+        return false;
+    }
+
+    if (!hook_code_patch_allowed()) {
+        int hits = hook_pointer_install(addr, repl);
+
+        if (hits > 0) {
+            g_install_count++;
+            g_ready = true;
+
+            brk_diag_log("install target=%p replacement=%p mode=pointer slots=%d status=1",
+                         (void *)addr, (void *)repl, hits);
+
+            return true;
+        }
+
         g_fail_count++;
         return false;
     }
@@ -1235,6 +1575,24 @@ bool brk_remove(void *target)
 
     uintptr_t addr = strip_fn(target);
 
+    hook_ptr_entry_t *ptrEntry = hook_pointer_find(addr);
+
+    if (ptrEntry) {
+        bool restored = true;
+
+        for (int i = 0; i < ptrEntry->count; i++) {
+            if (!hook_write_u64(ptrEntry->slots[i], ptrEntry->target)) restored = false;
+        }
+
+        int slotCount = ptrEntry->count;
+        memset(ptrEntry, 0, sizeof(hook_ptr_entry_t));
+
+        brk_diag_log("remove target=%p mode=pointer slots=%d status=%d",
+                     (void *)addr, slotCount, restored ? 1 : 0);
+
+        return restored;
+    }
+
     pthread_mutex_lock(&g_lock);
 
     hook_entry_t *entry = hook_find_locked(addr);
@@ -1298,6 +1656,8 @@ void *brk_original_ptr(void *target)
     if (!target) return NULL;
 
     uintptr_t addr = strip_fn(target);
+
+    if (hook_pointer_find(addr)) return (void *)addr;
 
     pthread_mutex_lock(&g_lock);
     hook_entry_t *entry = hook_find_locked(addr);
@@ -1485,12 +1845,15 @@ void brk_log_state(void)
         if (g_hooks[i].used && g_hooks[i].armed) live++;
     }
 
-    brk_diag_log("state slots=%d live=%d installed=%llu hits=%llu fails=%llu",
+    brk_diag_log("state slots=%d live=%d installed=%llu hits=%llu fails=%llu ptr_hooks=%d ptr_slots=%d code_patch=%d",
                  HOOK_MAX,
                  live,
                  (unsigned long long)g_install_count,
                  (unsigned long long)g_total_hits,
-                 (unsigned long long)g_fail_count);
+                 (unsigned long long)g_fail_count,
+                 hook_pointer_count(),
+                 hook_pointer_slots(),
+                 hook_code_patch_allowed() ? 1 : 0);
 
     for (int i = 0; i < HOOK_MAX; i++) {
         if (!g_hooks[i].used) continue;
