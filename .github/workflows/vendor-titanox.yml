@@ -1,41 +1,1475 @@
-name: Vendor Titanox
+name: brk hook rework
+
 on:
   workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - 'libtitanox/**'
+
 permissions:
   contents: write
+
+concurrency:
+  group: brk-hook-rework
+  cancel-in-progress: false
+
 jobs:
-  vendor:
+  rework:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout
+        uses: actions/checkout@v4
         with:
           fetch-depth: 0
           token: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Clone upstream
+      - name: Apply fix
         run: |
-          rm -rf /tmp/up
-          git clone --depth 1 https://github.com/Ragekill3377/Titanox.git /tmp/up
-          rm -rf /tmp/up/.git
-          rm -rf /tmp/up/.github
+          python3 - <<'PYFIX'
+          import os
+          import re
+          import sys
 
-      - name: Copy
-        run: cp -an /tmp/up/. .
+          ROOT = os.getcwd()
+          SRC_EXT = (".c", ".h", ".mm", ".m", ".hpp", ".cpp", ".cc", ".tpp", ".swift")
 
-      - name: Patch segment
+          FAIL = []
+
+
+          def die(msg):
+              print("FAIL: " + msg)
+              sys.exit(1)
+
+
+          def note(msg):
+              print("  " + msg)
+
+
+          def read(path):
+              with open(path, "r", encoding="utf-8", errors="surrogateescape") as f:
+                  return f.read()
+
+
+          def write(path, text):
+              d = os.path.dirname(path)
+              if d and not os.path.isdir(d):
+                  os.makedirs(d)
+              with open(path, "w", encoding="utf-8", errors="surrogateescape") as f:
+                  f.write(text)
+
+
+          def strip_comments(text):
+              out = []
+              i = 0
+              n = len(text)
+              while i < n:
+                  c = text[i]
+                  if c == '"' or c == "'":
+                      q = c
+                      out.append(c)
+                      i += 1
+                      while i < n:
+                          ch = text[i]
+                          if ch == "\\" and i + 1 < n:
+                              out.append(ch)
+                              out.append(text[i + 1])
+                              i += 2
+                              continue
+                          out.append(ch)
+                          i += 1
+                          if ch == q:
+                              break
+                          if ch == "\n":
+                              break
+                      continue
+                  if c == "/" and i + 1 < n and text[i + 1] == "/":
+                      while i < n:
+                          j = text.find("\n", i)
+                          if j == -1:
+                              j = n
+                          back = (j > 0 and text[j - 1] == "\\")
+                          i = j
+                          if not back:
+                              break
+                      out.append("\n")
+                      continue
+                  if c == "/" and i + 1 < n and text[i + 1] == "*":
+                      j = text.find("*/", i + 2)
+                      if j == -1:
+                          j = n
+                      else:
+                          j += 2
+                      out.append("\n" * text.count("\n", i, j))
+                      i = j
+                      continue
+                  out.append(c)
+                  i += 1
+              lines = []
+              for line in "".join(out).split("\n"):
+                  lines.append(line.rstrip())
+              return "\n".join(lines)
+
+
+          SHELL_NAMES = ("build", "size", "githelper")
+
+
+          def strip_hash_line(line):
+              out = []
+              i = 0
+              n = len(line)
+              quote = None
+              while i < n:
+                  c = line[i]
+                  if quote is None:
+                      if c == "\\":
+                          out.append(c)
+                          if i + 1 < n:
+                              out.append(line[i + 1])
+                          i += 2
+                          continue
+                      if c == "'" or c == '"':
+                          quote = c
+                          out.append(c)
+                          i += 1
+                          continue
+                      if c == "#" and (i == 0 or line[i - 1] in " \t"):
+                          break
+                      out.append(c)
+                      i += 1
+                      continue
+                  out.append(c)
+                  if c == "\\" and i + 1 < n:
+                      out.append(line[i + 1])
+                      i += 2
+                      continue
+                  if c == quote:
+                      quote = None
+                  i += 1
+              return "".join(out).rstrip()
+
+
+          def strip_hash_comments(text):
+              lines = text.split("\n")
+              out = []
+              i = 0
+              n = len(lines)
+              while i < n:
+                  line = lines[i]
+                  if i == 0 and line.startswith("#!"):
+                      out.append(line.rstrip())
+                      i += 1
+                      continue
+                  stripped = strip_hash_line(line)
+                  if not stripped and line.lstrip().startswith("#") and line.rstrip().endswith("\\"):
+                      j = i + 1
+                      while j < n:
+                          cont = lines[j].rstrip().endswith("\\")
+                          j += 1
+                          if not cont:
+                              break
+                      i = j
+                      continue
+                  if stripped.endswith("\\") and not line.rstrip().endswith("\\"):
+                      stripped = stripped[:-1].rstrip()
+                  out.append(stripped)
+                  i += 1
+              return "\n".join(out)
+
+
+          def has_hash_comment(text):
+              lines = text.split("\n")
+              for idx, line in enumerate(lines):
+                  if idx == 0 and line.startswith("#!"):
+                      continue
+                  if strip_hash_line(line) != line.rstrip():
+                      return True
+              return False
+
+
+          def hash_files():
+              found = []
+              for base, dirs, files in os.walk("."):
+                  dirs[:] = [d for d in dirs if d != ".git"]
+                  for name in files:
+                      if name == "Makefile" or name.endswith(".sh") or name in SHELL_NAMES:
+                          found.append(os.path.join(base, name)[2:])
+              return sorted(found)
+
+
+          def has_comment(text):
+              i = 0
+              n = len(text)
+              while i < n:
+                  c = text[i]
+                  if c == '"' or c == "'":
+                      q = c
+                      i += 1
+                      while i < n:
+                          ch = text[i]
+                          if ch == "\\" and i + 1 < n:
+                              i += 2
+                              continue
+                          i += 1
+                          if ch == q or ch == "\n":
+                              break
+                      continue
+                  if c == "/" and i + 1 < n and text[i + 1] in "/*":
+                      return True
+                  i += 1
+              return False
+
+
+          HOOK_H = '''#ifndef TITANOX_BRK_HOOK_H
+          #define TITANOX_BRK_HOOK_H
+
+          #include <stdbool.h>
+          #include <stdint.h>
+
+          #ifdef __cplusplus
+          extern "C" {
+          #endif
+
+          bool hook(void *old[], void *new[], int count);
+          bool unhook(void *old[], int count);
+
+          bool brk_install(void *target, void *replacement);
+          bool brk_remove(void *target);
+          void *brk_original_ptr(void *target);
+          void brk_suspend_self(void);
+          void brk_resume_self(void);
+          int brk_active_count(void);
+          int brk_slot_limit(void);
+          bool brk_selftest(void);
+          void brk_log_state(void);
+
+          #ifdef __cplusplus
+          }
+          #endif
+
+          #endif
+          '''
+
+          WRAPPER_HPP = '''#pragma once
+
+          #include "hook.h"
+
+          class HookWrapper {
+          public:
+              static bool callHook(void *origArray[], void *hookArray[], int count) {
+                  return hook(origArray, hookArray, count);
+              }
+
+              static bool callUnHook(void *origArray[], int count) {
+                  return unhook(origArray, count);
+              }
+
+              static bool install(void *target, void *replacement) {
+                  return brk_install(target, replacement);
+              }
+
+              static bool remove(void *target) {
+                  return brk_remove(target);
+              }
+
+              static void *originalPointer(void *target) {
+                  return brk_original_ptr(target);
+              }
+
+              static void suspendSelf(void) {
+                  brk_suspend_self();
+              }
+
+              static void resumeSelf(void) {
+                  brk_resume_self();
+              }
+
+              static bool selfTest(void) {
+                  return brk_selftest();
+              }
+          };
+          '''
+
+          HOOK_C = '''#include "hook.h"
+          #include "mach_excServer.h"
+          #include <mach-o/dyld_images.h>
+          #include <mach-o/nlist.h>
+          #include <mach/mach.h>
+          #include <os/log.h>
+          #include <pthread.h>
+          #include <stdbool.h>
+          #include <stdint.h>
+          #include <string.h>
+          #include <sys/mman.h>
+          #include <sys/stat.h>
+          #include <sys/sysctl.h>
+          #include <unistd.h>
+
+          #ifndef __has_feature
+          #define __has_feature(x) 0
+          #endif
+
+          #if __has_feature(ptrauth_calls)
+          #include <ptrauth.h>
+          #endif
+
+          #define BRK_MAX_HOOKS 16
+          #define BRK_BCR_VALUE 0x1e5
+          #define BRK_SWEEP_US 500000
+          #define BRK_SLOT_CAP 16
+          #define BRK_SLOT_DEFAULT 6
+
+          typedef struct {
+              uintptr_t target;
+              uintptr_t replacement;
+              bool used;
+          } brk_entry_t;
+
+          static brk_entry_t g_entries[BRK_MAX_HOOKS];
+          static int g_entry_count = 0;
+          static mach_port_t g_port = MACH_PORT_NULL;
+          static mach_port_t g_orig_port = MACH_PORT_NULL;
+          static int g_slot_limit = BRK_SLOT_DEFAULT;
+          static bool g_ready = false;
+          static pthread_mutex_t g_lock = PTHREAD_MUTEX_INITIALIZER;
+          static arm_debug_state64_t g_desired;
+          static int g_desired_slots = 0;
+          static volatile int g_sweep_stop = 0;
+          static bool g_sweep_started = false;
+
+          static os_log_t brk_channel(void) {
+              static os_log_t ch = NULL;
+              if (ch == NULL) {
+                  ch = os_log_create("com.titanox.brk", "hook");
+              }
+              return ch;
+          }
+
+          static void brk_log(const char *tag, uint64_t a, uint64_t b) {
+              os_log_with_type(brk_channel(), OS_LOG_TYPE_DEFAULT,
+                               "[titanox] %{public}s a=%{public}llu b=%{public}llu",
+                               tag, (unsigned long long)a, (unsigned long long)b);
+          }
+
+          static uintptr_t brk_strip(const void *p) {
+              if (p == NULL) {
+                  return 0;
+              }
+          #if __has_feature(ptrauth_calls)
+              return (uintptr_t)ptrauth_strip(p, ptrauth_key_function_pointer);
+          #else
+              return (uintptr_t)p;
+          #endif
+          }
+
+          static void *brk_sign(uintptr_t raw) {
+          #if __has_feature(ptrauth_calls)
+              return ptrauth_sign_unauthenticated((void *)raw, ptrauth_key_function_pointer, 0);
+          #else
+              return (void *)raw;
+          #endif
+          }
+
+          kern_return_t catch_mach_exception_raise(
+              mach_port_t exception_port, mach_port_t thread, mach_port_t task,
+              exception_type_t exception, mach_exception_data_t code,
+              mach_msg_type_number_t codeCnt) {
+              brk_log("exc_raise_identity", (uint64_t)exception, (uint64_t)codeCnt);
+              return KERN_FAILURE;
+          }
+
+          kern_return_t catch_mach_exception_raise_state_identity(
+              mach_port_t exception_port, mach_port_t thread, mach_port_t task,
+              exception_type_t exception, mach_exception_data_t code,
+              mach_msg_type_number_t codeCnt, int *flavor, thread_state_t old_state,
+              mach_msg_type_number_t old_stateCnt, thread_state_t new_state,
+              mach_msg_type_number_t *new_stateCnt) {
+              brk_log("exc_raise_state_identity", (uint64_t)exception, (uint64_t)codeCnt);
+              return KERN_FAILURE;
+          }
+
+          kern_return_t catch_mach_exception_raise_state(
+              mach_port_t exception_port, exception_type_t exception,
+              const mach_exception_data_t code, mach_msg_type_number_t codeCnt,
+              int *flavor, const thread_state_t old_state,
+              mach_msg_type_number_t old_stateCnt, thread_state_t new_state,
+              mach_msg_type_number_t *new_stateCnt) {
+
+              arm_thread_state64_t *old_st = (arm_thread_state64_t *)old_state;
+              arm_thread_state64_t *new_st = (arm_thread_state64_t *)new_state;
+
+              uintptr_t pc = (uintptr_t)arm_thread_state64_get_pc(*old_st);
+              uintptr_t dest = 0;
+
+              pthread_mutex_lock(&g_lock);
+              for (int i = 0; i < g_entry_count; i++) {
+                  if (!g_entries[i].used) {
+                      continue;
+                  }
+                  if (g_entries[i].target == pc) {
+                      dest = g_entries[i].replacement;
+                      break;
+                  }
+              }
+              pthread_mutex_unlock(&g_lock);
+
+              if (dest != 0) {
+                  *new_st = *old_st;
+                  *new_stateCnt = old_stateCnt;
+                  arm_thread_state64_set_pc_fptr(*new_st, brk_sign(dest));
+                  return KERN_SUCCESS;
+              }
+
+              if (g_orig_port != MACH_PORT_NULL) {
+                  return mach_msg_server(mach_exc_server,
+                                         sizeof(union __RequestUnion__catch_mach_exc_subsystem),
+                                         g_orig_port, MACH_MSG_OPTION_NONE);
+              }
+
+              brk_log("unhandled_breakpoint", (uint64_t)pc, (uint64_t)exception);
+              return KERN_FAILURE;
+          }
+
+          static void *brk_exception_thread(void *arg) {
+              for (;;) {
+                  mach_msg_server(mach_exc_server,
+                                  sizeof(union __RequestUnion__catch_mach_exc_subsystem),
+                                  g_port, MACH_MSG_OPTION_NONE);
+              }
+              return NULL;
+          }
+
+          static void brk_build_desired(void) {
+              memset(&g_desired, 0, sizeof(g_desired));
+              int slot = 0;
+              for (int i = 0; i < g_entry_count; i++) {
+                  if (!g_entries[i].used) {
+                      continue;
+                  }
+                  if (slot >= g_slot_limit) {
+                      break;
+                  }
+                  g_desired.__bvr[slot] = (uint64_t)g_entries[i].target;
+                  g_desired.__bcr[slot] = (uint32_t)BRK_BCR_VALUE;
+                  slot++;
+              }
+              g_desired_slots = slot;
+          }
+
+          static void brk_sync_threads(bool force) {
+              arm_debug_state64_t desired;
+              int slots;
+
+              pthread_mutex_lock(&g_lock);
+              desired = g_desired;
+              slots = g_desired_slots;
+              pthread_mutex_unlock(&g_lock);
+
+              task_t task = mach_task_self();
+              thread_act_array_t threads = NULL;
+              mach_msg_type_number_t count = 0;
+              if (task_threads(task, &threads, &count) != KERN_SUCCESS) {
+                  brk_log("task_threads_failed", 0, 0);
+                  return;
+              }
+
+              for (mach_msg_type_number_t i = 0; i < count; i++) {
+                  arm_debug_state64_t cur;
+                  mach_msg_type_number_t cur_cnt = ARM_DEBUG_STATE64_COUNT;
+                  bool write = force;
+                  if (thread_get_state(threads[i], ARM_DEBUG_STATE64, (thread_state_t)&cur,
+                                       &cur_cnt) == KERN_SUCCESS) {
+                      if (force) {
+                          bool same = true;
+                          for (int s = 0; s < slots; s++) {
+                              if (cur.__bvr[s] != desired.__bvr[s] || (cur.__bcr[s] & 1u) == 0) {
+                                  same = false;
+                                  break;
+                              }
+                          }
+                          write = !same;
+                      } else {
+                          bool virgin = true;
+                          for (int s = 0; s < slots; s++) {
+                              if ((cur.__bcr[s] & 1u) != 0) {
+                                  virgin = false;
+                                  break;
+                              }
+                          }
+                          write = virgin;
+                      }
+                  }
+                  if (write) {
+                      thread_set_state(threads[i], ARM_DEBUG_STATE64, (thread_state_t)&desired,
+                                       ARM_DEBUG_STATE64_COUNT);
+                  }
+                  mach_port_deallocate(task, threads[i]);
+              }
+              vm_deallocate(task, (vm_address_t)threads, count * sizeof(thread_act_t));
+          }
+
+          static void brk_publish(void) {
+              arm_debug_state64_t desired;
+
+              pthread_mutex_lock(&g_lock);
+              brk_build_desired();
+              desired = g_desired;
+              pthread_mutex_unlock(&g_lock);
+
+              task_set_state(mach_task_self(), ARM_DEBUG_STATE64, (thread_state_t)&desired,
+                             ARM_DEBUG_STATE64_COUNT);
+              brk_sync_threads(true);
+          }
+
+          static void *brk_sweep_thread(void *arg) {
+              while (!g_sweep_stop) {
+                  usleep(BRK_SWEEP_US);
+                  brk_sync_threads(false);
+              }
+              return NULL;
+          }
+
+          static bool brk_init(void) {
+              if (g_ready) {
+                  return true;
+              }
+
+              size_t sz = sizeof(g_slot_limit);
+              int bp = 0;
+              if (sysctlbyname("hw.optional.breakpoint", &bp, &sz, NULL, 0) == 0 && bp > 0) {
+                  g_slot_limit = bp;
+              }
+              if (g_slot_limit < 1) {
+                  g_slot_limit = BRK_SLOT_DEFAULT;
+              }
+              if (g_slot_limit > BRK_SLOT_CAP) {
+                  g_slot_limit = BRK_SLOT_CAP;
+              }
+
+              mach_port_t ports[EXC_TYPES_COUNT];
+              exception_mask_t masks[EXC_TYPES_COUNT];
+              exception_behavior_t behaviors[EXC_TYPES_COUNT];
+              thread_state_flavor_t flavors[EXC_TYPES_COUNT];
+              mach_msg_type_number_t port_count = EXC_TYPES_COUNT;
+              memset(ports, 0, sizeof(ports));
+
+              if (task_get_exception_ports(mach_task_self(), EXC_MASK_BREAKPOINT, masks,
+                                           &port_count, ports, behaviors,
+                                           flavors) == KERN_SUCCESS && port_count > 0) {
+                  g_orig_port = ports[0];
+              }
+
+              if (mach_port_allocate(mach_task_self(), MACH_PORT_RIGHT_RECEIVE,
+                                     &g_port) != KERN_SUCCESS) {
+                  brk_log("port_allocate_failed", 0, 0);
+                  return false;
+              }
+              if (mach_port_insert_right(mach_task_self(), g_port, g_port,
+                                         MACH_MSG_TYPE_MAKE_SEND) != KERN_SUCCESS) {
+                  brk_log("port_insert_failed", 0, 0);
+                  return false;
+              }
+              if (task_set_exception_ports(mach_task_self(), EXC_MASK_BREAKPOINT, g_port,
+                                           EXCEPTION_STATE | MACH_EXCEPTION_CODES,
+                                           ARM_THREAD_STATE64) != KERN_SUCCESS) {
+                  brk_log("set_exception_ports_failed", 0, 0);
+                  return false;
+              }
+
+              pthread_t th;
+              if (pthread_create(&th, NULL, brk_exception_thread, NULL) != 0) {
+                  brk_log("exception_thread_failed", 0, 0);
+                  return false;
+              }
+              pthread_detach(th);
+
+              g_ready = true;
+              brk_log("init", (uint64_t)g_slot_limit, (uint64_t)g_orig_port);
+
+              if (!g_sweep_started) {
+                  g_sweep_started = true;
+                  pthread_t sweep;
+                  if (pthread_create(&sweep, NULL, brk_sweep_thread, NULL) == 0) {
+                      pthread_detach(sweep);
+                  }
+              }
+              return true;
+          }
+
+          static bool brk_register(uintptr_t target, uintptr_t replacement) {
+              bool ok = false;
+              int used = 0;
+
+              pthread_mutex_lock(&g_lock);
+              for (int i = 0; i < g_entry_count; i++) {
+                  if (g_entries[i].used) {
+                      used++;
+                  }
+              }
+              for (int i = 0; i < g_entry_count; i++) {
+                  if (g_entries[i].used && g_entries[i].target == target) {
+                      g_entries[i].replacement = replacement;
+                      ok = true;
+                      break;
+                  }
+              }
+              if (!ok && used < g_slot_limit) {
+                  for (int i = 0; i < g_entry_count; i++) {
+                      if (!g_entries[i].used) {
+                          g_entries[i].target = target;
+                          g_entries[i].replacement = replacement;
+                          g_entries[i].used = true;
+                          ok = true;
+                          break;
+                      }
+                  }
+                  if (!ok && g_entry_count < BRK_MAX_HOOKS) {
+                      g_entries[g_entry_count].target = target;
+                      g_entries[g_entry_count].replacement = replacement;
+                      g_entries[g_entry_count].used = true;
+                      g_entry_count++;
+                      ok = true;
+                  }
+              }
+              pthread_mutex_unlock(&g_lock);
+              return ok;
+          }
+
+          bool brk_install(void *target, void *replacement) {
+              if (target == NULL || replacement == NULL) {
+                  return false;
+              }
+              if (!brk_init()) {
+                  return false;
+              }
+
+              uintptr_t t = brk_strip(target);
+              uintptr_t r = brk_strip(replacement);
+              if (t == 0 || r == 0) {
+                  return false;
+              }
+              if (!brk_register(t, r)) {
+                  brk_log("install_rejected", t, (uint64_t)g_slot_limit);
+                  return false;
+              }
+
+              brk_publish();
+              brk_log("installed", t, r);
+              return true;
+          }
+
+          bool brk_remove(void *target) {
+              if (target == NULL) {
+                  return false;
+              }
+
+              uintptr_t t = brk_strip(target);
+              bool found = false;
+
+              pthread_mutex_lock(&g_lock);
+              for (int i = 0; i < g_entry_count; i++) {
+                  if (g_entries[i].used && g_entries[i].target == t) {
+                      g_entries[i].used = false;
+                      g_entries[i].target = 0;
+                      g_entries[i].replacement = 0;
+                      found = true;
+                  }
+              }
+              pthread_mutex_unlock(&g_lock);
+
+              if (found) {
+                  brk_publish();
+                  brk_log("removed", t, 0);
+              }
+              return found;
+          }
+
+          bool hook(void *old[], void *new[], int count) {
+              if (old == NULL || new == NULL || count <= 0) {
+                  return false;
+              }
+              int done = 0;
+              for (int i = 0; i < count; i++) {
+                  if (brk_install(old[i], new[i])) {
+                      done++;
+                  }
+              }
+              return done == count;
+          }
+
+          bool unhook(void *old[], int count) {
+              if (old == NULL || count <= 0) {
+                  return false;
+              }
+              int done = 0;
+              for (int i = 0; i < count; i++) {
+                  if (brk_remove(old[i])) {
+                      done++;
+                  }
+              }
+              return done == count;
+          }
+
+          void *brk_original_ptr(void *target) {
+              if (target == NULL) {
+                  return NULL;
+              }
+              return brk_sign(brk_strip(target));
+          }
+
+          void brk_suspend_self(void) {
+              arm_debug_state64_t empty;
+              memset(&empty, 0, sizeof(empty));
+              thread_t self = mach_thread_self();
+              thread_set_state(self, ARM_DEBUG_STATE64, (thread_state_t)&empty,
+                               ARM_DEBUG_STATE64_COUNT);
+              mach_port_deallocate(mach_task_self(), self);
+          }
+
+          void brk_resume_self(void) {
+              arm_debug_state64_t desired;
+
+              pthread_mutex_lock(&g_lock);
+              desired = g_desired;
+              pthread_mutex_unlock(&g_lock);
+
+              thread_t self = mach_thread_self();
+              thread_set_state(self, ARM_DEBUG_STATE64, (thread_state_t)&desired,
+                               ARM_DEBUG_STATE64_COUNT);
+              mach_port_deallocate(mach_task_self(), self);
+          }
+
+          int brk_active_count(void) {
+              int used = 0;
+              pthread_mutex_lock(&g_lock);
+              for (int i = 0; i < g_entry_count; i++) {
+                  if (g_entries[i].used) {
+                      used++;
+                  }
+              }
+              pthread_mutex_unlock(&g_lock);
+              return used;
+          }
+
+          int brk_slot_limit(void) {
+              if (!g_ready) {
+                  brk_init();
+              }
+              return g_slot_limit;
+          }
+
+          void brk_log_state(void) {
+              brk_log("state_active", (uint64_t)brk_active_count(), (uint64_t)g_slot_limit);
+          }
+
+          static volatile int g_selftest_hits = 0;
+
+          __attribute__((noinline)) static void brk_selftest_target(void) {
+              g_selftest_hits = 100;
+          }
+
+          __attribute__((noinline)) static void brk_selftest_probe(void) {
+              g_selftest_hits = 1;
+          }
+
+          bool brk_selftest(void) {
+              if (!brk_init()) {
+                  return false;
+              }
+
+              void *target = (void *)&brk_selftest_target;
+              void *probe = (void *)&brk_selftest_probe;
+              if (!brk_install(target, probe)) {
+                  brk_log("selftest_install_failed", 0, 0);
+                  return false;
+              }
+
+              g_selftest_hits = 0;
+              brk_selftest_target();
+              int hits = g_selftest_hits;
+              brk_remove(target);
+              brk_log("selftest", (uint64_t)hits, 0);
+              return hits == 1;
+          }
+          '''
+
+
+          README_MD = '''# Titanox
+
+          Hooking library for jailed iOS. This copy has a reworked breakpoint hook.
+
+          ## What is in here
+
+          Breakpoint hooks use hardware breakpoints (BRP registers) plus a Mach exception
+          port. Nothing is written into the target code, so this works on the `__TEXT` of a
+          signed binary. Six concurrent hooks, and a hook can call the original.
+
+          Also in the box: inline hook and patch (binary rewrite, needs re-signing), symbol
+          hooks via fishhook, ObjC swizzling, vtable hooks via MemX.
+
+          ## Breakpoint hook
+
+          ```cpp
+          #include "brk_hook/Hook/hook_wrapper.hpp"
+
+          static void (*orig_tick)(void *, float) = nullptr;
+
+          static void tick(void *self, float dt) {
+              brk_suspend_self();
+              if (orig_tick) orig_tick(self, dt);
+              brk_resume_self();
+          }
+
+          void install(uintptr_t target) {
+              orig_tick = (void (*)(void *, float))brk_original_ptr((void *)target);
+              brk_install((void *)target, (void *)&tick);
+          }
+          ```
+
+          `suspend_self` / `resume_self` only touch the calling thread. That is the whole
+          trick behind calling the original: with the breakpoints off for that thread, the
+          original address is an ordinary function again.
+
+          ObjC side:
+
+          ```objc
+          [TitanoxHook addBreakpointAtAddress:target withHook:(void *)&tick];
+          [TitanoxHook breakpointSelfTest];
+          ```
+
+          ## Self test
+
+          `brk_selftest()` arms a breakpoint on a function, calls it, and checks whether the
+          replacement actually ran. On a jailed iOS 26/27 app that is the only honest way to
+          find out whether the mechanism is alive on the device. Call it once at startup and
+          look for `selftest` in `com.titanox.brk`.
+
+          ## Build
+
+          ```
+          cd libtitanox
+          make package
+          ```
+
+          ## Notes
+
+          - Breakpoint state lives in the BRP registers and is per thread. Threads created
+            after install inherit it from the task; a 500 ms sweep picks up the rest.
+          - Six slots is the hardware limit. `brk_slot_limit()` reports what the device gives.
+          - Each breakpoint hook costs one exception round trip per call. Fine at 60 Hz, not
+            fine inside a tight loop.
+          - Breakpoints that are not ours are forwarded to whatever handler was registered
+            before us (debugger, crash reporter).
+          - On arm64e the addresses are PAC-stripped before they are written into DBGBVR, and
+            `brk_original_ptr()` hands back a signed function pointer.
+
+          ## Credits
+
+          rage for Titanox. Euclid Jan G. and Saagar Jha for the breakpoint hook. ElleKit for
+          the idea, LiveContainer for a shipped example of the same trick on iOS 26+.
+          '''
+
+          GITIGNORE = '''.DS_Store
+          .theos/
+          packages/
+          derived/
+          xcuserdata/
+          *.deb
+          *.o
+          *.dylib
+          *.a
+          *.log
+          *.tmp
+          TITANOX_LOGS.txt
+          '''
+
+          ADD_DECL_OLD = '''+ (BOOL)addBreakpointAtAddress:(void *)original withHook:(void *)hook;
+          + (BOOL)removeBreakpointAtAddress:(void *)original;'''
+
+          ADD_DECL_NEW = '''+ (BOOL)addBreakpointAtAddress:(void *)original withHook:(void *)hook;
+          + (BOOL)removeBreakpointAtAddress:(void *)original;
+          + (void *)originalPointerForBreakpoint:(void *)original;
+          + (void)suspendBreakpoints;
+          + (void)resumeBreakpoints;
+          + (BOOL)breakpointSelfTest;
+          + (int)breakpointSlotLimit;'''
+
+          ADD_METHOD_SIG = "+ (BOOL)addBreakpointAtAddress:(void *)original withHook:(void *)hook {"
+          ADD_METHOD_NEW = '''+ (BOOL)addBreakpointAtAddress:(void *)original withHook:(void *)hook {
+              if (!original || !hook) {
+                  THLog(@"[ERROR] addBreakpointAtAddress: invalid params. original=%p, hook=%p", original, hook);
+                  return NO;
+              }
+              if (!HookWrapper::install(original, hook)) {
+                  THLog(@"[ERROR] brk_install failed for %p (slots %d/%d)", original, brk_active_count(), brk_slot_limit());
+                  return NO;
+              }
+              THLog(@"[BRK] hooked %p -> %p (%d/%d slots)", original, hook, brk_active_count(), brk_slot_limit());
+              return YES;
+          }'''
+
+          REM_METHOD_SIG = "+ (BOOL)removeBreakpointAtAddress:(void *)original {"
+          REM_METHOD_NEW = '''+ (BOOL)removeBreakpointAtAddress:(void *)original {
+              if (!original) {
+                  THLog(@"[ERROR] removeBreakpointAtAddress: invalid param");
+                  return NO;
+              }
+              if (!HookWrapper::remove(original)) {
+                  THLog(@"[ERROR] no breakpoint at %p", original);
+                  return NO;
+              }
+              THLog(@"[BRK] unhooked %p (%d/%d slots)", original, brk_active_count(), brk_slot_limit());
+              return YES;
+          }'''
+
+          EXTRA_METHODS = '''
+
+          + (void *)originalPointerForBreakpoint:(void *)original {
+              return original ? HookWrapper::originalPointer(original) : NULL;
+          }
+
+          + (void)suspendBreakpoints {
+              HookWrapper::suspendSelf();
+          }
+
+          + (void)resumeBreakpoints {
+              HookWrapper::resumeSelf();
+          }
+
+          + (BOOL)breakpointSelfTest {
+              return HookWrapper::selfTest() ? YES : NO;
+          }
+
+          + (int)breakpointSlotLimit {
+              return brk_slot_limit();
+          }'''
+
+          PRAGMA_OLD = "#pragma mark - remove breakpoint (Only supports new method)"
+          PRAGMA_NEW = "#pragma mark - remove breakpoint (orig supported)"
+
+
+          def method_span(text, sig):
+              start = text.find(sig)
+              if start < 0:
+                  return None
+              i = text.find("{", start)
+              if i < 0:
+                  return None
+              depth = 0
+              while i < len(text):
+                  ch = text[i]
+                  if ch == "{":
+                      depth += 1
+                  elif ch == "}":
+                      depth -= 1
+                      if depth == 0:
+                          return (start, i + 1)
+                  i += 1
+              return None
+
+
+          def swap_method(text, sig, new_body, label):
+              span = method_span(text, sig)
+              if span is None:
+                  if new_body.splitlines()[0] in text:
+                      note(label + " already patched")
+                      return text
+                  die("cannot locate " + label)
+              return text[:span[0]] + new_body + text[span[1]:]
+
+
+          def patch_header():
+              path = os.path.join("libtitanox", "libtitanox", "libtitanox.h")
+              text = read(path)
+              if ADD_DECL_NEW.splitlines()[-1] in text and "originalPointerForBreakpoint" in text:
+                  note("libtitanox.h already patched")
+                  return
+              if ADD_DECL_OLD not in text:
+                  die("breakpoint declarations not found in libtitanox.h")
+              write(path, text.replace(ADD_DECL_OLD, ADD_DECL_NEW, 1))
+              note("libtitanox.h declarations extended")
+
+
+          def patch_main():
+              path = os.path.join("libtitanox", "libtitanox", "main.mm")
+              text = read(path)
+
+              text = swap_method(text, ADD_METHOD_SIG, ADD_METHOD_NEW, "addBreakpointAtAddress")
+
+              span = method_span(text, REM_METHOD_SIG)
+              if span is None:
+                  die("cannot locate removeBreakpointAtAddress")
+              extra = "" if "originalPointerForBreakpoint" in text else EXTRA_METHODS
+              text = text[:span[0]] + REM_METHOD_NEW + extra + text[span[1]:]
+
+              if PRAGMA_OLD in text:
+                  text = text.replace(PRAGMA_OLD, PRAGMA_NEW, 1)
+
+              write(path, text)
+              note("main.mm breakpoint methods replaced")
+
+
+          def source_files():
+              found = []
+              for base, dirs, files in os.walk("."):
+                  dirs[:] = [d for d in dirs if d != ".git"]
+                  for name in files:
+                      if name.endswith(SRC_EXT):
+                          found.append(os.path.join(base, name)[2:])
+              return sorted(found)
+
+
+          def strip_all():
+              print("stripping comments")
+              changed = 0
+              kept = 0
+              for path in hash_files():
+                  original = read(path)
+                  if not has_hash_comment(original):
+                      kept += 1
+                      continue
+                  stripped = strip_hash_comments(original)
+                  write(path, stripped)
+                  changed += 1
+                  print("  " + path)
+              for path in source_files():
+                  original = read(path)
+                  if 'R"' in original:
+                      die("raw string literal in " + path + ", stripper would be unsafe")
+                  if not has_comment(original):
+                      kept += 1
+                      continue
+                  stripped = strip_comments(original)
+                  if has_comment(stripped):
+                      die("comments left in " + path)
+                  if strip_comments(stripped) != stripped:
+                      die("stripper is not idempotent on " + path)
+                  write(path, stripped)
+                  changed += 1
+                  print("  " + path)
+              print("  stripped: " + str(changed) + ", already clean: " + str(kept))
+
+
+          def main():
+              os.chdir(ROOT)
+              if not os.path.isdir("libtitanox"):
+                  die("run this from the repository root")
+
+              hook_dir = os.path.join("libtitanox", "brk_hook", "Hook")
+              if not os.path.isdir(hook_dir):
+                  die("libtitanox/brk_hook/Hook is missing")
+
+              write(os.path.join(hook_dir, "hook.h"), HOOK_H)
+              write(os.path.join(hook_dir, "hook.c"), HOOK_C)
+              write(os.path.join(hook_dir, "hook_wrapper.hpp"), WRAPPER_HPP)
+              note("hook.h, hook.c, hook_wrapper.hpp written")
+
+              patch_header()
+              patch_main()
+
+              write("README.md", README_MD)
+              write(".gitignore", GITIGNORE)
+              note("README.md and .gitignore written")
+
+              strip_all()
+              print("DONE")
+
+
+          main()
+
+          PYFIX
+
+      - name: Verify
         run: |
-          grep -rl 'HOOK_DATA_SEGMENT.*"__TITANOX_HOOK"' . 2>/dev/null | while read f; do
-            echo "patch $f"
-            sed -i.bak 's/HOOK_DATA_SEGMENT.*"__TITANOX_HOOK"/HOOK_DATA_SEGMENT = "__TITANOX_DATA"/' "$f"
-            rm -f "$f.bak"
-          done
-          grep -rn 'HOOK_TEXT_SEGMENT\|HOOK_DATA_SEGMENT' . | head || true
+          python3 - <<'PYVERIFY'
+          import os
+          import subprocess
+          import sys
+          import tempfile
+
+          ROOT = os.getcwd()
+          SRC_EXT = (".c", ".h", ".mm", ".m", ".hpp", ".cpp", ".cc", ".tpp", ".swift")
+          SHELL_NAMES = ("build", "size", "githelper")
+          REWRITTEN = (
+              "libtitanox/brk_hook/Hook/hook.c",
+              "libtitanox/brk_hook/Hook/hook.h",
+              "libtitanox/brk_hook/Hook/hook_wrapper.hpp",
+              "libtitanox/libtitanox/main.mm",
+              "libtitanox/libtitanox/libtitanox.h",
+          )
+          HOOK_C_SYMBOLS = (
+              "brk_install",
+              "brk_remove",
+              "brk_original_ptr",
+              "brk_suspend_self",
+              "brk_resume_self",
+              "brk_active_count",
+              "brk_slot_limit",
+              "brk_selftest",
+              "brk_log_state",
+              "hook(",
+              "unhook(",
+              "catch_mach_exception_raise_state",
+              "task_threads",
+              "thread_set_state",
+              "thread_get_state",
+              "task_set_state",
+              "task_set_exception_ports",
+              "ARM_DEBUG_STATE64",
+              "0x1e5",
+              "ptrauth_strip",
+              "arm_thread_state64_set_pc_fptr",
+              "mach_exc_server",
+          )
+          HOOK_C_FORBIDDEN = ("abort(", "get_pc_fptr", "OXLogC", "g_in_hook", "printf(")
+          STUBS = {
+              'Availability.h': '#ifndef STUB_AVAILABILITY_H\n#define STUB_AVAILABILITY_H\n#define __API_AVAILABLE(...)\n#define __API_DEPRECATED(...)\n#endif\n',
+              'mach-o/dyld_images.h': '#ifndef STUB_DYLD_IMAGES_H\n#define STUB_DYLD_IMAGES_H\n#endif\n',
+              'mach-o/nlist.h': '#ifndef STUB_NLIST_H\n#define STUB_NLIST_H\n#endif\n',
+              'mach/arm/thread_status.h': '#ifndef STUB_ARM_THREAD_STATUS_H\n#define STUB_ARM_THREAD_STATUS_H\n#include <stdint.h>\n#include <mach/mach_types.h>\nstruct __darwin_arm_thread_state64 { uint64_t __x[29]; uint64_t __fp; uint64_t __lr; uint64_t __sp; uint64_t __pc; uint32_t __cpsr; uint32_t __pad; };\ntypedef struct __darwin_arm_thread_state64 arm_thread_state64_t;\nstruct __darwin_arm_debug_state64 { uint64_t __bvr[16]; uint64_t __bcr[16]; uint64_t __wvr[16]; uint64_t __wcr[16]; uint64_t __mdscr_el1; };\ntypedef struct __darwin_arm_debug_state64 arm_debug_state64_t;\n#define ARM_THREAD_STATE64 6\n#define ARM_DEBUG_STATE64 15\n#define ARM_THREAD_STATE64_COUNT ((mach_msg_type_number_t)(sizeof(arm_thread_state64_t) / sizeof(uint32_t)))\n#define ARM_DEBUG_STATE64_COUNT ((mach_msg_type_number_t)(sizeof(arm_debug_state64_t) / sizeof(uint32_t)))\n#define arm_thread_state64_get_pc(ts) ((uintptr_t)((ts).__pc))\n#define arm_thread_state64_get_pc_fptr(ts) ((void *)(uintptr_t)((ts).__pc))\n#define arm_thread_state64_set_pc_fptr(ts, fptr) ((ts).__pc = (uintptr_t)(fptr))\n#define arm_thread_state64_set_pc_presigned_fptr(ts, fptr) ((ts).__pc = (uintptr_t)(fptr))\n#endif\n',
+              'mach/boolean.h': '#ifndef STUB_MACH_BOOLEAN_H\n#define STUB_MACH_BOOLEAN_H\ntypedef unsigned int boolean_t;\n#define TRUE 1\n#define FALSE 0\n#endif\n',
+              'mach/exception_types.h': '#ifndef STUB_MACH_EXCEPTION_TYPES_H\n#define STUB_MACH_EXCEPTION_TYPES_H\n#include <mach/mach_types.h>\n#define EXC_BAD_ACCESS 1\n#define EXC_BREAKPOINT 6\n#define EXC_MASK_BREAKPOINT (1u << 6)\n#define EXCEPTION_DEFAULT 1\n#define EXCEPTION_STATE 2\n#define MACH_EXCEPTION_CODES 0x80000000u\n#define EXC_TYPES_COUNT 14\nkern_return_t task_get_exception_ports(mach_port_t task, exception_mask_t mask, exception_mask_t *masks, mach_msg_type_number_t *count, exception_handler_t *ports, exception_behavior_t *behaviors, thread_state_flavor_t *flavors);\nkern_return_t task_set_exception_ports(mach_port_t task, exception_mask_t mask, exception_handler_t port, exception_behavior_t behavior, thread_state_flavor_t flavor);\n#endif\n',
+              'mach/kern_return.h': '#ifndef STUB_MACH_KERN_RETURN_H\n#define STUB_MACH_KERN_RETURN_H\n#define KERN_SUCCESS 0\n#define KERN_INVALID_ADDRESS 1\n#define KERN_PROTECTION_FAILURE 2\n#define KERN_NO_SPACE 3\n#define KERN_INVALID_ARGUMENT 4\n#define KERN_FAILURE 5\n#endif\n',
+              'mach/mach.h': '#ifndef STUB_MACH_H\n#define STUB_MACH_H\n#include <mach/mach_types.h>\n#include <mach/kern_return.h>\n#include <mach/port.h>\n#include <mach/message.h>\n#include <mach/ndr.h>\n#include <mach/boolean.h>\n#include <mach/notify.h>\n#include <mach/mig_errors.h>\n#include <mach/mig.h>\n#include <mach/exception_types.h>\n#include <mach/std_types.h>\n#include <mach/arm/thread_status.h>\nkern_return_t task_threads(task_t task, thread_act_array_t *threads, mach_msg_type_number_t *count);\nkern_return_t thread_get_state(thread_act_t thread, thread_state_flavor_t flavor, thread_state_t state, mach_msg_type_number_t *count);\nkern_return_t thread_set_state(thread_act_t thread, thread_state_flavor_t flavor, thread_state_t state, mach_msg_type_number_t count);\nkern_return_t task_set_state(task_t task, int flavor, thread_state_t state, mach_msg_type_number_t count);\nmach_port_t mach_task_self(void);\nkern_return_t vm_deallocate(vm_map_t target, vm_address_t address, vm_size_t size);\n#endif\n',
+              'mach/mach_types.h': '#ifndef STUB_MACH_TYPES_H\n#define STUB_MACH_TYPES_H\n#include <stdint.h>\n#include <mach/vm_types.h>\ntypedef unsigned int mach_port_t;\ntypedef unsigned int mach_msg_type_number_t;\ntypedef int kern_return_t;\ntypedef unsigned int natural_t;\ntypedef int integer_t;\ntypedef unsigned int task_t;\ntypedef unsigned int thread_t;\ntypedef unsigned int thread_act_t;\ntypedef thread_act_t *thread_act_array_t;\ntypedef unsigned int exception_type_t;\ntypedef unsigned int exception_mask_t;\ntypedef int exception_behavior_t;\ntypedef int thread_state_flavor_t;\ntypedef unsigned int mach_msg_options_t;\ntypedef unsigned int mach_msg_size_t;\ntypedef unsigned int mach_msg_bits_t;\ntypedef int mach_msg_id_t;\ntypedef mach_port_t host_t;\ntypedef mach_port_t exception_handler_t;\ntypedef unsigned int *thread_state_t;\ntypedef natural_t *mach_exception_data_t;\n#endif\n',
+              'mach/message.h': '#ifndef STUB_MACH_MESSAGE_H\n#define STUB_MACH_MESSAGE_H\n#include <mach/mach_types.h>\n#include <mach/boolean.h>\ntypedef unsigned int mach_msg_type_t;\ntypedef struct { mach_msg_bits_t msgh_bits; mach_msg_size_t msgh_size; mach_port_t msgh_remote_port; mach_port_t msgh_local_port; mach_msg_size_t msgh_reserved; mach_msg_id_t msgh_id; } mach_msg_header_t;\ntypedef struct { mach_msg_size_t msgh_descriptor_count; } mach_msg_body_t;\ntypedef struct { mach_port_t name; mach_msg_size_t pad1; unsigned int pad2; mach_msg_type_t type; unsigned int pad3; } mach_msg_port_descriptor_t;\ntypedef int mach_msg_return_t;\n#define MACH_MSG_TYPE_MAKE_SEND 20\n#define MACH_MSG_OPTION_NONE 0\nmach_msg_return_t mach_msg_server(boolean_t (*demux)(mach_msg_header_t *, mach_msg_header_t *), mach_msg_size_t rcv_size, mach_port_t rcv_name, mach_msg_options_t options);\n#endif\n',
+              'mach/mig.h': '#ifndef STUB_MACH_MIG_H\n#define STUB_MACH_MIG_H\n#define MIG_SERVER_ROUTINE\n#define mig_external\ntypedef unsigned int mig_routine_t;\ntypedef mig_routine_t (*mig_server_routine_t)(mach_msg_header_t *);\nstruct routine_descriptor { void *stub_routine; unsigned int routine_number; };\n#endif\n',
+              'mach/mig_errors.h': '#ifndef STUB_MACH_MIG_ERRORS_H\n#define STUB_MACH_MIG_ERRORS_H\n#define MIG_TYPE_ERROR 1\n#endif\n',
+              'mach/ndr.h': '#ifndef STUB_MACH_NDR_H\n#define STUB_MACH_NDR_H\ntypedef struct { unsigned char mig_vers; unsigned char if_vers; unsigned char reserved1; unsigned char mig_encoding; unsigned char int_rep; unsigned char char_rep; unsigned char float_rep; unsigned char reserved2; } NDR_record_t;\nextern NDR_record_t NDR_record;\n#endif\n',
+              'mach/notify.h': '#ifndef STUB_MACH_NOTIFY_H\n#define STUB_MACH_NOTIFY_H\n#endif\n',
+              'mach/port.h': '#ifndef STUB_MACH_PORT_H\n#define STUB_MACH_PORT_H\n#include <mach/mach_types.h>\n#define MACH_PORT_NULL 0\n#define MACH_PORT_RIGHT_SEND 0\n#define MACH_PORT_RIGHT_RECEIVE 1\nkern_return_t mach_port_allocate(mach_port_t task, int right, mach_port_t *name);\nkern_return_t mach_port_insert_right(mach_port_t task, mach_port_t name, mach_port_t poly, int type);\nkern_return_t mach_port_deallocate(mach_port_t task, mach_port_t name);\nmach_port_t mach_thread_self(void);\n#endif\n',
+              'mach/std_types.h': '#ifndef STUB_MACH_STD_TYPES_H\n#define STUB_MACH_STD_TYPES_H\n#include <mach/mach_types.h>\n#endif\n',
+              'mach/vm_types.h': '#ifndef STUB_VM_TYPES_H\n#define STUB_VM_TYPES_H\ntypedef unsigned long vm_address_t;\ntypedef unsigned long vm_size_t;\ntypedef unsigned long vm_offset_t;\ntypedef unsigned int vm_map_t;\n#endif\n',
+              'os/log.h': '#ifndef STUB_OS_LOG_H\n#define STUB_OS_LOG_H\ntypedef struct os_log_s *os_log_t;\n#define OS_LOG_TYPE_DEFAULT 0\nos_log_t os_log_create(const char *subsystem, const char *category);\nvoid os_log_with_type(os_log_t log, int type, const char *format, ...);\n#endif\n',
+              'sys/sysctl.h': '#ifndef STUB_SYS_SYSCTL_H\n#define STUB_SYS_SYSCTL_H\n#include <stddef.h>\nint sysctlbyname(const char *name, void *oldp, size_t *oldlenp, void *newp, size_t newlen);\n#endif\n',
+          }
+
+          errors = []
+
+
+          def fail(msg):
+              errors.append(msg)
+              print("FAIL " + msg)
+
+
+          def read(path):
+              with open(path, "r", encoding="utf-8", errors="surrogateescape") as f:
+                  return f.read()
+
+
+          def code_chars(text):
+              out = []
+              i = 0
+              n = len(text)
+              while i < n:
+                  c = text[i]
+                  if c == '"' or c == "'":
+                      q = c
+                      i += 1
+                      while i < n:
+                          if text[i] == "\\" and i + 1 < n:
+                              i += 2
+                              continue
+                          ch = text[i]
+                          i += 1
+                          if ch == q or ch == "\n":
+                              break
+                      continue
+                  if c == "/" and i + 1 < n and text[i + 1] == "/":
+                      while i < n and text[i] != "\n":
+                          i += 1
+                      continue
+                  if c == "/" and i + 1 < n and text[i + 1] == "*":
+                      j = text.find("*/", i + 2)
+                      i = n if j == -1 else j + 2
+                      continue
+                  out.append(c)
+                  i += 1
+              return "".join(out)
+
+
+          def strip_hash_line(line):
+              out = []
+              i = 0
+              n = len(line)
+              quote = None
+              while i < n:
+                  c = line[i]
+                  if quote is None:
+                      if c == "\\":
+                          out.append(c)
+                          if i + 1 < n:
+                              out.append(line[i + 1])
+                          i += 2
+                          continue
+                      if c == "'" or c == '"':
+                          quote = c
+                          out.append(c)
+                          i += 1
+                          continue
+                      if c == "#" and (i == 0 or line[i - 1] in " \t"):
+                          break
+                      out.append(c)
+                      i += 1
+                      continue
+                  out.append(c)
+                  if c == "\\" and i + 1 < n:
+                      out.append(line[i + 1])
+                      i += 2
+                      continue
+                  if c == quote:
+                      quote = None
+                  i += 1
+              return "".join(out).rstrip()
+
+
+          def source_files():
+              found = []
+              for base, dirs, files in os.walk("."):
+                  dirs[:] = [d for d in dirs if d != ".git"]
+                  for name in files:
+                      if name.endswith(SRC_EXT):
+                          found.append(os.path.join(base, name)[2:])
+              return sorted(found)
+
+
+          def hash_files():
+              found = []
+              for base, dirs, files in os.walk("."):
+                  dirs[:] = [d for d in dirs if d != ".git"]
+                  for name in files:
+                      if name == "Makefile" or name.endswith(".sh") or name in SHELL_NAMES:
+                          found.append(os.path.join(base, name)[2:])
+              return sorted(found)
+
+
+          def check_comments():
+              dirty = []
+              c_files = source_files()
+              h_files = hash_files()
+              for path in c_files:
+                  body = code_chars(read(path))
+                  if "//" in body or "/*" in body or "*/" in body:
+                      dirty.append(path)
+              for path in h_files:
+                  lines = read(path).split("\n")
+                  for idx, line in enumerate(lines):
+                      if idx == 0 and line.startswith("#!"):
+                          continue
+                      if strip_hash_line(line) != line.rstrip():
+                          dirty.append(path)
+                          break
+              if dirty:
+                  for path in dirty:
+                      fail("comments left in " + path)
+              else:
+                  print("ok comments: " + str(len(c_files) + len(h_files)) + " files clean")
+
+
+          def check_shell_syntax():
+              checked = 0
+              for path in hash_files():
+                  if path == "Makefile":
+                      continue
+                  proc = subprocess.run(["bash", "-n", path], capture_output=True, text=True)
+                  if proc.returncode != 0:
+                      fail("bash -n failed for " + path + ": " + proc.stderr.strip()[:200])
+                      continue
+                  checked += 1
+              print("ok shell: " + str(checked) + " scripts parse")
+
+
+          def drop_shebang(text):
+              lines = text.split("\n")
+              if lines and lines[0].startswith("#!"):
+                  lines = lines[1:]
+              return "\n".join(lines)
+
+
+          def logical_lines(text):
+              lines = drop_shebang(text).split("\n")
+              out = []
+              cur = ""
+              for line in lines:
+                  if line.rstrip().endswith("\\"):
+                      cur += line.rstrip()[:-1] + " "
+                      continue
+                  cur += line
+                  out.append(cur)
+                  cur = ""
+              if cur:
+                  out.append(cur)
+              return out
+
+
+          def code_projection(text):
+              res = []
+              for line in logical_lines(text):
+                  stripped = strip_hash_line(line)
+                  if stripped.strip():
+                      res.append(stripped)
+              return res
+
+
+          def check_hash_untouched():
+              checked = 0
+              for path in hash_files():
+                  old = subprocess.run(["git", "show", "HEAD:" + path], capture_output=True, text=True)
+                  if old.returncode != 0:
+                      continue
+                  new = read(path)
+                  if old.stdout == new:
+                      continue
+                  if code_projection(old.stdout) != code_projection(new):
+                      fail("shell or make code changed in " + path + " by comment stripping")
+                      continue
+                  checked += 1
+              print("ok shell code untouched: " + str(checked) + " stripped files match git HEAD")
+
+
+          def check_braces():
+              bad = []
+              for path in source_files():
+                  body = code_chars(read(path))
+                  if body.count("{") != body.count("}") or body.count("(") != body.count(")"):
+                      bad.append(path)
+              if bad:
+                  for path in bad:
+                      fail("unbalanced braces in " + path)
+              else:
+                  print("ok braces: balanced")
+
+
+          def check_hook_c():
+              path = "libtitanox/brk_hook/Hook/hook.c"
+              if not os.path.isfile(path):
+                  fail("hook.c missing")
+                  return
+              body = read(path)
+              for sym in HOOK_C_SYMBOLS:
+                  if sym not in body:
+                      fail("hook.c lacks " + sym)
+              for bad in HOOK_C_FORBIDDEN:
+                  if bad in body:
+                      fail("hook.c still contains " + bad)
+              print("ok hook.c: " + str(len(HOOK_C_SYMBOLS)) + " symbols present")
+
+
+          def check_cross_file():
+              header = read("libtitanox/brk_hook/Hook/hook.h")
+              hook = read("libtitanox/brk_hook/Hook/hook.c")
+              objc = read("libtitanox/libtitanox/main.mm")
+              decl = read("libtitanox/libtitanox/libtitanox.h")
+              for sym in ("brk_install", "brk_remove", "brk_original_ptr", "brk_suspend_self",
+                          "brk_resume_self", "brk_selftest"):
+                  if sym not in header:
+                      fail("hook.h lacks " + sym)
+                  if sym not in hook:
+                      fail("hook.c lacks " + sym)
+              for method in ("originalPointerForBreakpoint", "suspendBreakpoints", "resumeBreakpoints",
+                             "breakpointSelfTest", "breakpointSlotLimit"):
+                  if method not in objc:
+                      fail("main.mm lacks " + method)
+                  if method not in decl:
+                      fail("libtitanox.h lacks " + method)
+              if "OXLogC" in hook or "OXLogC" in objc:
+                  fail("OXLogC still referenced")
+              print("ok cross file: header, hook.c, main.mm, libtitanox.h agree")
+
+
+          def blank_includes(text):
+              out = []
+              for line in text.split("\n"):
+                  s = line.lstrip()
+                  if s.startswith("#include") or s.startswith("#import") or s.startswith("#pragma once"):
+                      out.append("")
+                  else:
+                      out.append(line.replace("#import", "#include"))
+              return "\n".join(out)
+
+
+          def preprocess(text):
+              handle, path = tempfile.mkstemp(suffix=".c", dir="/tmp")
+              with os.fdopen(handle, "w", encoding="utf-8", errors="surrogateescape") as f:
+                  f.write(blank_includes(text))
+              proc = subprocess.run(
+                  ["gcc", "-E", "-P", "-nostdinc", "-Wno-unknown-pragmas", "-D__has_feature(x)=0",
+                   "-x", "c", path],
+                  capture_output=True, text=True)
+              os.unlink(path)
+              return proc.returncode, proc.stdout
+
+
+          def check_code_untouched():
+              checked = 0
+              for path in source_files():
+                  if path in REWRITTEN:
+                      continue
+                  old = subprocess.run(["git", "show", "HEAD:" + path], capture_output=True, text=True)
+                  if old.returncode != 0:
+                      continue
+                  new = read(path)
+                  if old.stdout == new:
+                      continue
+                  rc_a, out_a = preprocess(old.stdout)
+                  rc_b, out_b = preprocess(new)
+                  if rc_a != rc_b or out_a != out_b:
+                      fail("preprocessing changed for " + path)
+                      continue
+                  checked += 1
+              print("ok code untouched: " + str(checked) + " stripped files match git HEAD")
+
+
+          def check_syntax():
+              root = "/tmp/titanox_stub"
+              for rel, body in STUBS.items():
+                  path = os.path.join(root, rel)
+                  d = os.path.dirname(path)
+                  if d and not os.path.isdir(d):
+                      os.makedirs(d)
+                  with open(path, "w", encoding="utf-8") as f:
+                      f.write(body)
+              hook_dir = "libtitanox/brk_hook/Hook"
+              gcc = subprocess.run(
+                  ["gcc", "-fsyntax-only", "-Wall", "-Wextra", "-Wno-unused-parameter",
+                   "-x", "c", "-I", root, "-I", hook_dir, hook_dir + "/hook.c"],
+                  capture_output=True, text=True)
+              if gcc.returncode != 0:
+                  fail("hook.c does not compile against stub mach headers")
+                  print(gcc.stderr[:4000])
+              else:
+                  print("ok syntax: hook.c compiles clean")
+
+
+          def main():
+              os.chdir(ROOT)
+              check_comments()
+              check_shell_syntax()
+              check_hash_untouched()
+              check_braces()
+              check_hook_c()
+              check_syntax()
+              check_cross_file()
+              check_code_untouched()
+              if errors:
+                  print("VERIFY FAILED: " + str(len(errors)))
+                  sys.exit(1)
+              print("VERIFY OK")
+
+
+          main()
+
+          PYVERIFY
 
       - name: Commit
         run: |
-          git config user.name bot
-          git config user.email bot@users.noreply.github.com
+          git config user.name titanox-bot
+          git config user.email titanox-bot@users.noreply.github.com
           git add -A
-          git reset .github/workflows/
-          git diff --staged --quiet || git commit -m "vendor titanox"
-          git push
+          if git diff --cached --quiet; then
+            echo "nothing to commit"
+            exit 0
+          fi
+          git diff --cached --stat
+          git commit -m "brk hook: hardware breakpoint rework [skip ci]"
+          git push || (git pull --rebase && git push)
