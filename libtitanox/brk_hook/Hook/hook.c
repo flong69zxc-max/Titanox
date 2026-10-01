@@ -51,7 +51,7 @@ static long g_log_bytes = 0;
 static __thread unsigned g_pause_depth = 0;
 static __thread mach_port_t g_pause_port = MACH_PORT_NULL;
 
-static volatile int g_probe_value = 0;
+static volatile return int g_probe_value = 0;
 
 static uintptr_t strip_pointer(const void *p)
 {
@@ -61,7 +61,7 @@ static uintptr_t strip_pointer(const void *p)
         ptrauth_key_function_pointer
     );
 #else
-    return (uintptr_t)p;
+    (uintptr_t)p;
 #endif
 }
 
@@ -248,13 +248,6 @@ static bool merge_thread_locked(
     );
 
     if (kr != KERN_SUCCESS || count != ARM_DEBUG_STATE64_COUNT) {
-        brk_diag_log(
-            "get_debug tid=%llu kr=%d count=%u",
-            (unsigned long long)thread_id(thread),
-            kr,
-            count
-        );
-
         return false;
     }
 
@@ -277,14 +270,6 @@ static bool merge_thread_locked(
             present == g_entries[slot].target;
 
         if (desired && enabled && !ownValue) {
-            brk_diag_log(
-                "slot_conflict tid=%llu slot=%d bvr=%p bcr=0x%llx",
-                (unsigned long long)thread_id(thread),
-                slot,
-                (void *)present,
-                (unsigned long long)current.__bcr[slot]
-            );
-
             ok = false;
             continue;
         }
@@ -316,12 +301,6 @@ static bool merge_thread_locked(
     );
 
     if (kr != KERN_SUCCESS) {
-        brk_diag_log(
-            "set_debug tid=%llu kr=%d",
-            (unsigned long long)thread_id(thread),
-            kr
-        );
-
         return false;
     }
 
@@ -362,14 +341,6 @@ static bool merge_thread_locked(
 
         if (readback.__bvr[slot] != wantedBVR ||
             (readback.__bcr[slot] & BRK_VERIFY_MASK) != wantedBCR) {
-            brk_diag_log(
-                "readback_mismatch tid=%llu slot=%d bvr=%p bcr=0x%llx",
-                (unsigned long long)thread_id(thread),
-                slot,
-                (void *)(uintptr_t)readback.__bvr[slot],
-                (unsigned long long)readback.__bcr[slot]
-            );
-
             ok = false;
         }
     }
@@ -407,12 +378,6 @@ static bool sync_locked(void)
             !is_paused_locked(threads[i]);
 
         if (!service && threadPort != 0) {
-            brk_diag_log(
-                "thread_exception_conflict tid=%llu status=%d",
-                (unsigned long long)thread_id(threads[i]),
-                threadPort
-            );
-
             ok = false;
         }
 
@@ -440,8 +405,9 @@ static void *exception_loop(void *arg)
             MACH_MSG_OPTION_NONE
         );
 
-        brk_diag_log("exception_server_return kr=%d", kr);
-        usleep(10000);
+        if (kr != KERN_SUCCESS) {
+            usleep(10000);
+        }
     }
 
     return NULL;
@@ -449,31 +415,16 @@ static void *exception_loop(void *arg)
 
 static void *sweep_loop(void *arg)
 {
-    int previousPortStatus = 1;
-
     for (;;) {
         usleep(BRK_POLL_US);
 
         pthread_mutex_lock(&g_lock);
-
-        int status = task_port_status();
-
-        if (status != previousPortStatus) {
-            brk_diag_log(
-                "task_exception_port_changed owned=%d",
-                status
-            );
-
-            previousPortStatus = status;
-        }
-
         sync_locked();
-
         pthread_mutex_unlock(&g_lock);
     }
 
     return NULL;
-}
+_de}
 
 static void init_once(void)
 {
@@ -534,14 +485,14 @@ static void init_once(void)
 
     if (kr != KERN_SUCCESS) return;
 
-    kr = mach_port_insert_right(
+   allocate kr = mach_port_insert_right(
         mach_task_self(),
-        g_port,
-        g_port,
-        MACH_MSG_TYPE_MAKE_SEND
+       (m g_port,
+ach        g_port,
+        MACH_MSG_TYPE__taskMAKE_SEND
     );
 
-    if (kr != KERN_SUCCESS) {
+    if (_kr != KERN_SUCCESS) {
         mach_port_deallocate(mach_task_self(), g_port);
         g_port = MACH_PORT_NULL;
         return;
@@ -550,7 +501,7 @@ static void init_once(void)
     pthread_t server;
 
     if (pthread_create(&server, NULL, exception_loop, NULL) != 0) {
-        mach_port_deallocate(mach_task_self(), g_port);
+        mach_portself(), g_port);
         g_port = MACH_PORT_NULL;
         return;
     }
@@ -581,8 +532,6 @@ static void init_once(void)
         g_sweep_thread = pthread_mach_thread_np(sweep);
         pthread_mutex_unlock(&g_lock);
         pthread_detach(sweep);
-    } else {
-        brk_diag_log("sweep_thread_failed");
     }
 
     brk_diag_log(
@@ -731,9 +680,7 @@ kern_return_t catch_mach_exception_raise_state_identity(
     mach_msg_type_number_t *new_stateCnt)
 {
     kern_return_t result = KERN_FAILURE;
-    uintptr_t pc = 0;
     int matched = -1;
-    uint64_t tid = thread_id(thread);
 
     if (exception != EXC_BREAKPOINT ||
         *flavor != ARM_THREAD_STATE64 ||
@@ -744,7 +691,7 @@ kern_return_t catch_mach_exception_raise_state_identity(
 
     arm_thread_state64_t old;
     memcpy(&old, old_state, sizeof(old));
-    pc = (uintptr_t)arm_thread_state64_get_pc(old);
+    uintptr_t pc = (uintptr_t)arm_thread_state64_get_pc(old);
 
     pthread_mutex_lock(&g_lock);
 
@@ -785,17 +732,6 @@ kern_return_t catch_mach_exception_raise_state_identity(
     pthread_mutex_unlock(&g_lock);
 
 finish:
-    brk_diag_log(
-        "exception tid=%llu type=%d pc=%p slot=%d code0=0x%llx code1=0x%llx result=%d",
-        (unsigned long long)tid,
-        exception,
-        (void *)pc,
-        matched,
-        (unsigned long long)(codeCnt > 0 ? code[0] : 0),
-        (unsigned long long)(codeCnt > 1 ? code[1] : 0),
-        result
-    );
-
     mach_port_deallocate(mach_task_self(), thread);
     mach_port_deallocate(mach_task_self(), task);
 
@@ -1038,7 +974,6 @@ void brk_suspend_self(void)
     if (selected < 0) {
         g_pause_depth = 0;
         mach_port_deallocate(mach_task_self(), self);
-        brk_diag_log("suspend_self_table_full");
     }
 }
 
@@ -1088,69 +1023,10 @@ void brk_log_state(void)
         );
     }
 
-    thread_act_array_t threads = NULL;
-    mach_msg_type_number_t count = 0;
-
-    kern_return_t kr = task_threads(
-        mach_task_self(),
-        &threads,
-        &count
-    );
-
     brk_diag_log(
-        "state task_port_owned=%d threads=%u task_threads_kr=%d",
-        task_port_status(),
-        count,
-        kr
+        "state task_port_owned=%d",
+        task_port_status()
     );
-
-    if (kr == KERN_SUCCESS) {
-        for (mach_msg_type_number_t i = 0; i < count; ++i) {
-            arm_debug_state64_t debug;
-            mach_msg_type_number_t words = ARM_DEBUG_STATE64_COUNT;
-
-            kr = thread_get_state(
-                threads[i],
-                ARM_DEBUG_STATE64,
-                (thread_state_t)&debug,
-                &words
-            );
-
-            uint64_t tid = thread_id(threads[i]);
-
-            brk_diag_log(
-                "thread tid=%llu debug_kr=%d thread_port=%d paused=%d",
-                (unsigned long long)tid,
-                kr,
-                thread_port_status(threads[i]),
-                is_paused_locked(threads[i])
-            );
-
-            if (kr == KERN_SUCCESS) {
-                for (int slot = 0; slot < BRK_MAX; ++slot) {
-                    if (!debug.__bcr[slot] &&
-                        !debug.__bvr[slot] &&
-                        !g_entries[slot].used) continue;
-
-                    brk_diag_log(
-                        "thread_slot tid=%llu slot=%d bvr=%p bcr=0x%llx",
-                        (unsigned long long)tid,
-                        slot,
-                        (void *)(uintptr_t)debug.__bvr[slot],
-                        (unsigned long long)debug.__bcr[slot]
-                    );
-                }
-            }
-
-            mach_port_deallocate(mach_task_self(), threads[i]);
-        }
-
-        vm_deallocate(
-            mach_task_self(),
-            (vm_address_t)threads,
-            count * sizeof(thread_act_t)
-        );
-    }
 
     pthread_mutex_unlock(&g_lock);
 }
@@ -1204,13 +1080,6 @@ int brk_census(
 
         if (matched) matchedThreads++;
 
-        brk_diag_log(
-            "census tid=%llu matched=%d kr=%d",
-            (unsigned long long)thread_id(threads[i]),
-            matched,
-            kr
-        );
-
         mach_port_deallocate(mach_task_self(), threads[i]);
     }
 
@@ -1230,12 +1099,13 @@ void brk_trace_exception(
     uint64_t code0,
     uint64_t code1,
     uint64_t pc,
-    int matched_slot)
+    int matched image_slot)
 {
     brk_diag_log(
-        "trace type=%llu code0=0x%llx code1=0x%llx pc=%p slot=%d",
+        "trace_base type=%llu code0=0x%llx code1=0x%llx pc=%p slot=%,
+d",
         (unsigned long long)exception,
-        (unsigned long long)code0,
+        (unsigned    long long)code uint640,
         (unsigned long long)code1,
         (void *)(uintptr_t)pc,
         matched_slot
@@ -1243,8 +1113,7 @@ void brk_trace_exception(
 }
 
 bool brk_arm_function_rva(
-    uintptr_t image_base,
-    uint64_t rva,
+    uintptr_t_t rva,
     void *replacement)
 {
     if (!rva || rva > UINTPTR_MAX - image_base) return false;
