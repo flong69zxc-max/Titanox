@@ -11,6 +11,84 @@
 #import "../MemX/VMTWrapper.h"
 #import "../vm_funcs/vm.hpp"
 
+extern "C" {
+bool brk_chain_active(void);
+bool brk_host_is_livecontainer(void);
+mach_port_t brk_previous_port(void);
+uint64_t brk_chain_counters(uint64_t *fails);
+void brk_teardown(void);
+}
+
+static const char *TitanoxProtectedSymbols[] = {
+    "_dyld_get_image_header",
+    "_dyld_get_image_name",
+    "_dyld_get_image_vmaddr_slide",
+    "_dyld_image_count",
+    "_dlopen",
+    "_dlsym",
+    "dyld_get_image_header",
+    "dyld_get_image_name",
+    "dyld_get_image_vmaddr_slide",
+    "dyld_image_count",
+    "dlopen",
+    "dlsym",
+    NULL
+};
+
+static BOOL TitanoxSymbolIsProtected(const char *symbol) {
+    if (!symbol) return YES;
+
+    const char *name = symbol;
+    if (name[0] == '_') name++;
+
+    for (int i = 0; TitanoxProtectedSymbols[i]; i++) {
+        if (strcmp(symbol, TitanoxProtectedSymbols[i]) == 0) return YES;
+        if (strcmp(name, TitanoxProtectedSymbols[i]) == 0) return YES;
+    }
+
+    return NO;
+}
+
+static BOOL TitanoxHostIsLiveContainer(void) {
+    static int cached = -1;
+    if (cached >= 0) return cached ? YES : NO;
+
+    int found = 0;
+
+    uint32_t count = _dyld_image_count();
+    if (count > 8192) count = 8192;
+
+    for (uint32_t i = 0; i < count && !found; i++) {
+        const char *name = _dyld_get_image_name(i);
+        if (!name) continue;
+        if (strstr(name, "TweakLoader")) found = 1;
+        else if (strstr(name, "LiveContainer")) found = 1;
+        else if (strstr(name, "LiveContainerShared")) found = 1;
+        else if (strstr(name, "CydiaSubstrate")) found = 1;
+        else if (strstr(name, "libellekit")) found = 1;
+    }
+
+    if (!found) {
+        NSString *identifier = [NSBundle mainBundle].bundleIdentifier;
+        if (identifier &&
+            [identifier rangeOfString:@"livecontainer"
+                              options:NSCaseInsensitiveSearch].location != NSNotFound) {
+            found = 1;
+        }
+    }
+
+    if (!found && dlsym(RTLD_DEFAULT, "LiveContainerMain") != NULL) found = 1;
+
+    cached = found;
+    return found ? YES : NO;
+}
+
+static BOOL TitanoxHeaderIsValid(const struct mach_header *header) {
+    if (!header) return NO;
+    if (header->magic != MH_MAGIC_64 && header->magic != MH_MAGIC) return NO;
+    if (header->ncmds == 0 || header->ncmds > 4096) return NO;
+    return YES;
+}
 
 @implementation TitanoxHook : NSObject
 
@@ -23,23 +101,46 @@
     va_end(args);
 }
 
++ (BOOL)isProtectedSymbol:(const char *)symbol {
+    return TitanoxSymbolIsProtected(symbol);
+}
+
++ (BOOL)isHostLiveContainer {
+    return TitanoxHostIsLiveContainer();
+}
 
 #pragma mark - Base Address and VM Address Slide
 
 uint64_t GetBaseAddress(const char* libName) {
-    for (uint32_t i = 0; i < _dyld_image_count(); ++i) {
+    if (!libName) return 0;
+
+    uint32_t count = _dyld_image_count();
+    if (count > 8192) count = 8192;
+
+    for (uint32_t i = 0; i < count; ++i) {
         const char* DyldName = _dyld_get_image_name(i);
-        if (DyldName && strstr(DyldName, libName)) {
-            return (uint64_t)_dyld_get_image_header(i);
+        if (!DyldName) continue;
+        if (strstr(DyldName, libName)) {
+            const struct mach_header *header = _dyld_get_image_header(i);
+            if (!TitanoxHeaderIsValid(header)) continue;
+            return (uint64_t)header;
         }
     }
     return 0;
 }
 
 intptr_t GetVmAddrSlide(const char* libName) {
-    for (uint32_t i = 0; i < _dyld_image_count(); ++i) {
+    if (!libName) return 0;
+
+    uint32_t count = _dyld_image_count();
+    if (count > 8192) count = 8192;
+
+    for (uint32_t i = 0; i < count; ++i) {
         const char* DyldName = _dyld_get_image_name(i);
-        if (DyldName && strstr(DyldName, libName)) {
+        if (!DyldName) continue;
+        if (strstr(DyldName, libName)) {
+            const struct mach_header *header = _dyld_get_image_header(i);
+            if (!TitanoxHeaderIsValid(header)) continue;
             return _dyld_get_image_vmaddr_slide(i);
         }
     }
@@ -48,12 +149,14 @@ intptr_t GetVmAddrSlide(const char* libName) {
 
 #pragma mark - Breakpoint hook
 
-
-
 + (BOOL)addBreakpointAtAddress:(void *)original withHook:(void *)hook {
     if (!original || !hook) {
         THLog(@"[ERROR] addBreakpointAtAddress: invalid params. original=%p, hook=%p", original, hook);
         return NO;
+    }
+    if (TitanoxHostIsLiveContainer()) {
+        THLog(@"[BRK] host=livecontainer previous_port=%u chained=%d",
+              (unsigned)brk_previous_port(), brk_chain_active() ? 1 : 0);
     }
     if (!HookWrapper::install(original, hook)) {
         THLog(@"[ERROR] brk_install failed for %p (slots %d/%d)", original, brk_active_count(), brk_slot_limit());
@@ -98,12 +201,22 @@ intptr_t GetVmAddrSlide(const char* libName) {
     return brk_slot_limit();
 }
 
++ (void)releaseHostExceptionPort {
+    brk_teardown();
+}
+
 + (NSString *)findExecInBundle:(NSString *)libName {
+    if (!libName || libName.length == 0) return nil;
+
     NSFileManager *fileManager = [NSFileManager defaultManager];
     NSString *mainBundlePath = [[NSBundle mainBundle] bundlePath];
+    if (!mainBundlePath) return nil;
+
     NSDirectoryEnumerator *enumerator = [fileManager enumeratorAtPath:mainBundlePath];
+    if (!enumerator) return nil;
 
     for (NSString *filePath in enumerator) {
+        if (!filePath) continue;
         if ([filePath.lastPathComponent isEqualToString:libName]) {
             return [mainBundlePath stringByAppendingPathComponent:filePath];
         }
@@ -121,14 +234,23 @@ intptr_t GetVmAddrSlide(const char* libName) {
 }
 
 + (BOOL)MemXreadMemory:(uintptr_t)address buffer:(void *)buffer length:(size_t)len {
+    if (!buffer) return NO;
     return MemX::_read(address, buffer, len);
 }
 
 + (NSString *)MemXreadString:(uintptr_t)address maxLength:(size_t)maxLen {
-    return [NSString stringWithUTF8String:MemX::ReadString((void *)address, maxLen).c_str()];
+    std::string value = MemX::ReadString((void *)address, maxLen);
+    if (value.empty()) return nil;
+    if (value == "Invalid Pointer!!") return nil;
+    return [NSString stringWithUTF8String:value.c_str()];
 }
 
 + (void)MemXwriteMemory:(uintptr_t)address value:(NSNumber *)value type:(NSString *)type {
+    if (!value || !type) {
+        THLog(@"[MemX] Invalid write request");
+        return;
+    }
+
     static NSDictionary<NSString *, NSNumber *> *typeMap;
     if (!typeMap) {
         typeMap = @{
@@ -141,8 +263,6 @@ intptr_t GetVmAddrSlide(const char* libName) {
         };
     }
 
-
-
     switch (typeMap[type].intValue) {
         case 0: MemX::Write<int>(address, [value intValue]); break;
         case 1: MemX::Write<long>(address, [value longValue]); break;
@@ -154,16 +274,11 @@ intptr_t GetVmAddrSlide(const char* libName) {
     }
 }
 
-
-
-
-
 + (void)ClearAddrRanges {
     MemX::ClearAddrRange();
 }
 
 #pragma mark - MemX Virtual Function hooking stuff
-
 
 + (void *)vmthookCreateWithNewFunction:(void *)newFunc index:(int32_t)index {
     if (!newFunc) {
@@ -179,8 +294,6 @@ intptr_t GetVmAddrSlide(const char* libName) {
     if (!makehook) {
         THLog(@"[ERROR] vmthookCreateWithNewFunction: Failed to create hook");
     } else {
-
-
         THLog(@"[Success] vmthookCreateWithNewFunction: Hook created at %p", makehook);
     }
     return makehook;
@@ -195,6 +308,10 @@ intptr_t GetVmAddrSlide(const char* libName) {
         THLog(@"[ERROR] vmthookSwap: ERROR - instance pointer is NULL");
         return;
     }
+    if (!MemX::IsValidPointer((uintptr_t)instance)) {
+        THLog(@"[ERROR] vmthookSwap: instance %p is not inside a known image", instance);
+        return;
+    }
     THLog(@"[...] vmthookSwap: Swapping hook %p on instance %p", hook, instance);
     VMTHook_Swap(hook, instance);
     THLog(@"[Success] vmthookSwap: Swap complete");
@@ -207,6 +324,10 @@ intptr_t GetVmAddrSlide(const char* libName) {
     }
     if (!instance) {
         THLog(@"[ERROR] vmthookReset: ERROR - instance pointer is NULL");
+        return;
+    }
+    if (!MemX::IsValidPointer((uintptr_t)instance)) {
+        THLog(@"[ERROR] vmthookReset: instance %p is not inside a known image", instance);
         return;
     }
     THLog(@"[...] vmthookReset: Resetting hook %p on instance %p", hook, instance);
@@ -231,6 +352,10 @@ intptr_t GetVmAddrSlide(const char* libName) {
     }
     if (index < 0) {
         THLog(@"[ERROR] vmtinvokerCreateWithInstance: ERROR - index (%d) is negative", index);
+        return NULL;
+    }
+    if (!MemX::IsValidPointer((uintptr_t)instance)) {
+        THLog(@"[ERROR] vmtinvokerCreateWithInstance: instance %p is not inside a known image", instance);
         return NULL;
     }
     THLog(@"[...] vmtinvokerCreateWithInstance: Creating invoker for instance %p, index %d", instance, index);
@@ -284,6 +409,7 @@ intptr_t GetVmAddrSlide(const char* libName) {
 
 - (void *)hookFunctionAtVaddr:(uint64_t)vaddr withReplacement:(void *)replacement {
     if (!_hooker || !replacement) return NULL;
+    if (vaddr == 0) return NULL;
     return _hooker->hook_function(vaddr, replacement);
 }
 
@@ -305,11 +431,26 @@ intptr_t GetVmAddrSlide(const char* libName) {
 
 + (void)hookStaticFunction:(const char *)symbol
          withReplacement:(void *)replacement
-          inLibrary:(const char *)libName
+           inLibrary:(const char *)libName
         outOldFunction:(void **)oldFunction {
+
+    if (!symbol || symbol[0] == 0 || !replacement) {
+        THLog(@"[ERROR] hookStaticFunction: invalid arguments");
+        return;
+    }
+
+    if (TitanoxSymbolIsProtected(symbol)) {
+        THLog(@"[ERROR] hookStaticFunction: refusing to rebind protected symbol %s", symbol);
+        return;
+    }
 
     NSString *libNameString = [NSString stringWithUTF8String:libName];
     NSString *libPath = [self findExecInBundle:libNameString];
+
+    if (!libPath) {
+        THLog(@"[ERROR] library not found in bundle: %s", libName);
+        return;
+    }
 
     void *handle = dlopen([libPath UTF8String], RTLD_NOW | RTLD_NOLOAD);
 
@@ -317,8 +458,6 @@ intptr_t GetVmAddrSlide(const char* libName) {
         THLog(@"Failed to open library: %s", libName);
         return;
     }
-
-
 
     void *symAddr = dlsym(handle, symbol);
     if (!symAddr) {
@@ -353,8 +492,18 @@ intptr_t GetVmAddrSlide(const char* libName) {
           withMethod:(SEL)swizzledSelector
             inClass:(Class)targetClass {
 
+    if (!originalSelector || !swizzledSelector || !targetClass) {
+        THLog(@"[ERROR] swizzleMethod: invalid arguments");
+        return;
+    }
+
     Method originalMethod = class_getInstanceMethod(targetClass, originalSelector);
     Method swizzledMethod = class_getInstanceMethod(targetClass, swizzledSelector);
+
+    if (!originalMethod || !swizzledMethod) {
+        THLog(@"[ERROR] swizzleMethod: method not found on class");
+        return;
+    }
 
     BOOL didAddMethod = class_addMethod(targetClass,
                                         originalSelector,
@@ -378,7 +527,17 @@ intptr_t GetVmAddrSlide(const char* libName) {
               withNewFunction:(IMP)newFunction
             oldFunctionPointer:(IMP *)oldFunctionPointer {
 
+    if (!targetClass || !selector || !newFunction) {
+        THLog(@"[ERROR] overrideMethodInClass: invalid arguments");
+        return;
+    }
+
     Method method = class_getInstanceMethod(targetClass, selector);
+
+    if (!method) {
+        THLog(@"[ERROR] overrideMethodInClass: method not found");
+        return;
+    }
 
     if (oldFunctionPointer) {
         *oldFunctionPointer = method_getImplementation(method);
@@ -390,22 +549,27 @@ intptr_t GetVmAddrSlide(const char* libName) {
 #pragma mark - Memory Patching
 
 + (BOOL)readMemoryAt:(mach_vm_address_t)address buffer:(void *)buffer size:(mach_vm_size_t)size {
+    if (!buffer || size == 0) return NO;
     return vm_read_custom(address, buffer, size);
 }
 
 + (BOOL)writeMemoryAt:(mach_vm_address_t)address data:(const void *)data size:(mach_vm_size_t)size {
+    if (!data || size == 0) return NO;
     return vm_write_custom(address, data, size);
 }
 
 + (void *)allocateMemoryWithSize:(mach_vm_size_t)size flags:(int)flags {
+    if (size == 0) return NULL;
     return vm_allocate_custom(size, flags);
 }
 
 + (BOOL)deallocateMemoryAt:(mach_vm_address_t)address size:(mach_vm_size_t)size {
+    if (address == 0 || size == 0) return NO;
     return vm_deallocate_custom(address, size);
 }
 
 + (kern_return_t)protectMemoryAt:(mach_vm_address_t)address size:(mach_vm_size_t)size setMax:(BOOL)setMax protection:(vm_prot_t)newProt {
+    if (address == 0 || size == 0) return KERN_INVALID_ARGUMENT;
     return vm_protect_custom(address, size, setMax, newProt);
 }
 
@@ -413,10 +577,13 @@ intptr_t GetVmAddrSlide(const char* libName) {
                    withPatch:(uint8_t*)patch
                        size:(size_t)size {
 
+    if (!address || !patch || size == 0) {
+        THLog(@"Invalid patch request.");
+        return;
+    }
 
-
-    if (!address) {
-        THLog(@"Invalid address.");
+    if (![self isSafeToPatchMemoryAtAddress:address length:size]) {
+        THLog(@"Memory patching aborted: unsafe memory region at %p", address);
         return;
     }
 
@@ -431,21 +598,23 @@ intptr_t GetVmAddrSlide(const char* libName) {
 
 #pragma mark - isHooked
 
-
-
 + (BOOL)isFunctionHooked:(const char *)symbol
            withOriginal:(void *)original
              inLibrary:(const char *)libName {
 
+    if (!symbol || !original) return YES;
+
     Dl_info info;
     if (dladdr(original, &info)) {
+        if (!info.dli_sname) return YES;
+
         NSString *libNameString = [NSString stringWithUTF8String:libName];
         NSString *libPath = [self findExecInBundle:libNameString];
 
         if (strcmp(info.dli_sname, symbol) == 0 &&
-            (!libName || [libPath isEqualToString:[NSString stringWithUTF8String:info.dli_fname]])) {
+            (!libName || (libPath && info.dli_fname &&
+             [libPath isEqualToString:[NSString stringWithUTF8String:info.dli_fname]]))) {
             return NO;
-
         }
     }
     return YES;
@@ -456,8 +625,23 @@ intptr_t GetVmAddrSlide(const char* libName) {
 + (void)hookBoolByName:(const char *)symbol
              inLibrary:(const char *)libName {
 
+    if (!symbol || symbol[0] == 0) {
+        THLog(@"[ERROR] hookBoolByName: invalid symbol");
+        return;
+    }
+
+    if (TitanoxSymbolIsProtected(symbol)) {
+        THLog(@"[ERROR] hookBoolByName: refusing to touch protected symbol %s", symbol);
+        return;
+    }
+
     NSString *libNameString = [NSString stringWithUTF8String:libName];
     NSString *libPath = [self findExecInBundle:libNameString];
+
+    if (!libPath) {
+        THLog(@"[ERROR] library not found in bundle: %s", libName);
+        return;
+    }
 
     void *handle = dlopen([libPath UTF8String], RTLD_NOW | RTLD_NOLOAD);
     if (!handle) {
@@ -498,16 +682,30 @@ intptr_t GetVmAddrSlide(const char* libName) {
     vm_size_t regionSize = 0;
     vm_region_basic_info_data_64_t info;
     mach_msg_type_number_t infoCount = VM_REGION_BASIC_INFO_COUNT_64;
-    mach_port_t objectName;
+    mach_port_t objectName = MACH_PORT_NULL;
 
     if (vm_region_64(mach_task_self(), &regionStart, &regionSize, VM_REGION_BASIC_INFO_64, (vm_region_info_t)&info, &infoCount, &objectName) != KERN_SUCCESS) {
         THLog(@"Error: Failed to get memory region info.");
         return NO;
     }
 
-    return info.protection & VM_PROT_WRITE;
-}
+    if (objectName != MACH_PORT_NULL) {
+        mach_port_deallocate(mach_task_self(), objectName);
+    }
 
+    if (regionSize == 0) return NO;
+    if ((uintptr_t)regionStart + (uintptr_t)regionSize < (uintptr_t)address + length) {
+        THLog(@"Error: requested patch crosses the region boundary.");
+        return NO;
+    }
+
+    if (info.protection & VM_PROT_EXECUTE) {
+        THLog(@"Error: refusing to patch executable memory.");
+        return NO;
+    }
+
+    return (info.protection & VM_PROT_WRITE) ? YES : NO;
+}
 
 #pragma mark - B.A & VM.ADDR.SLIDE
 
