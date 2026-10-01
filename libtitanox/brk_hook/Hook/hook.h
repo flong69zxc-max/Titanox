@@ -56,6 +56,8 @@ int brk_next_slot(int after);
 
 bool brk_selftest(void);
 
+bool brk_selftest_at(uintptr_t hint);
+
 void *brk_selftest_addr(void);
 
 void hook_selftest_probe(void);
