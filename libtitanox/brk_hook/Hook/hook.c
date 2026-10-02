@@ -1118,8 +1118,19 @@ static void hook_build_patch(uintptr_t replacement, uint8_t *out)
     hook_put32(out, 12, (uint32_t)((replacement >> 32) & 0xFFFFFFFFu));
 }
 
-#define HOOK_PTR_ENTRIES 16
-#define HOOK_PTR_SLOTS 32
+/* Both of these were too small, and the device said so plainly.
+
+   HOOK_PTR_SLOTS capped how many references to one target get rewritten. On the 19:03 run a
+   hook whose target is referenced by 443 slots reported `addr_hits=32 matches=443` and
+   `slots=32` -- so 411 of the 443 tables kept the original function and any object whose class
+   is among them could never reach the forwarder. That is indistinguishable, in the log, from
+   "the hook never fires", and it is the leading explanation for seven hooks reporting zero
+   calls across four runs in which a match was played.
+
+   The cost is 4 KB per entry instead of 256 bytes, and entries are static, so raising both is
+   simply 160 KB in the library image. */
+#define HOOK_PTR_ENTRIES 64
+#define HOOK_PTR_SLOTS 1024
 
 typedef struct {
     uintptr_t target;
