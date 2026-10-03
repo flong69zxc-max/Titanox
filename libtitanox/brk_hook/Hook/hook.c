@@ -1526,10 +1526,12 @@ static bool hook_entry_looks_like_function(uintptr_t target)
     if (!hook_read_bytes(target, &w, sizeof(w))) return false;
 
     if ((w & 0xFFC003FFu) == 0xD10003FFu) return true;
-    if ((w & 0xFFC07FFFu) == 0xA9007BFDu) return true;
-    if ((w & 0xFFC07FFFu) == 0xA9807BFDu) return true;
+    if ((w & 0xFF4003E0u) == 0xA90003E0u) return true;
+    if ((w & 0xFF4003E0u) == 0xA80003E0u) return true;
     if (w == 0xD503237Fu) return true;
+    if (w == 0xD503245Fu) return true;
     if (w == 0xD65F03C0u) return true;
+    if (w == 0x910003FDu) return true;
     if ((w & 0xFF000000u) == 0x14000000u) return true;
     if ((w & 0x9F000000u) == 0x10000000u) return true;
 
