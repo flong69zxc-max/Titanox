@@ -1131,6 +1131,7 @@ static void hook_build_patch(uintptr_t replacement, uint8_t *out)
    simply 160 KB in the library image. */
 #define HOOK_PTR_ENTRIES 64
 #define HOOK_PTR_SLOTS 1024
+#define HOOK_PTR_BULK_MAX 32
 
 typedef struct {
     uintptr_t target;
@@ -1517,9 +1518,28 @@ static int hook_scan_tables_value(uintptr_t imageBase, uintptr_t needle, uintptr
     return hits;
 }
 
+
+static bool hook_entry_looks_like_function(uintptr_t target)
+{
+    uint32_t w = 0;
+
+    if (!hook_read_bytes(target, &w, sizeof(w))) return false;
+
+    if ((w & 0xFFC003FFu) == 0xD10003FFu) return true;
+    if ((w & 0xFFC003FFu) == 0xA9007BFDu) return true;
+    if ((w & 0xFFE0001Fu) == 0xA9807BFDu) return true;
+    if (w == 0xD503237Fu) return true;
+    if (w == 0xD65F03C0u) return true;
+    if ((w & 0xFF000000u) == 0x14000000u) return true;
+    if ((w & 0x9F000000u) == 0x10000000u) return true;
+
+    return false;
+}
+
 static int hook_pointer_install(uintptr_t target, uintptr_t replacement)
 {
     hook_ptr_entry_t *entry = hook_pointer_find(target);
+    bool created = false;
 
     if (!entry) {
         for (int i = 0; i < HOOK_PTR_ENTRIES; i++) {
@@ -1528,6 +1548,7 @@ static int hook_pointer_install(uintptr_t target, uintptr_t replacement)
                 g_ptr_hooks[i].used = true;
                 g_ptr_hooks[i].target = target;
                 entry = &g_ptr_hooks[i];
+                created = true;
                 break;
             }
         }
@@ -1547,7 +1568,43 @@ static int hook_pointer_install(uintptr_t target, uintptr_t replacement)
 
     uintptr_t slots[HOOK_PTR_SLOTS];
 
-    int hits = hook_scan_tables_value(imageBase, target, replacement, slots, HOOK_PTR_SLOTS, false, "addr");
+    int hits = hook_scan_tables_value(imageBase, target, 0, slots, HOOK_PTR_SLOTS, true, "probe");
+
+    if (hits > HOOK_PTR_BULK_MAX) {
+        uint32_t w = 0;
+
+        hook_read_bytes(target, &w, sizeof(w));
+        hook_set_error("pointer hook: reject-bulk target=%p slots=%d max=%d first=%08x",
+                       (void *)target, hits, HOOK_PTR_BULK_MAX, w);
+        brk_diag_log("pointer hook: reject-bulk target=%p hits=%d max=%d first=%08x wrote=0",
+                     (void *)target, hits, HOOK_PTR_BULK_MAX, w);
+
+        if (created) {
+            entry->used = false;
+            entry->target = 0;
+            entry->count = 0;
+        }
+
+        return 0;
+    }
+
+    if (!hook_entry_looks_like_function(target)) {
+        uint32_t w = 0;
+
+        hook_read_bytes(target, &w, sizeof(w));
+        hook_set_error("pointer hook: reject-nonfunc target=%p first=%08x", (void *)target, w);
+        brk_diag_log("pointer hook: reject-nonfunc target=%p first=%08x wrote=0", (void *)target, w);
+
+        if (created) {
+            entry->used = false;
+            entry->target = 0;
+            entry->count = 0;
+        }
+
+        return 0;
+    }
+
+    hits = hook_scan_tables_value(imageBase, target, replacement, slots, HOOK_PTR_SLOTS, false, "addr");
 
     uint64_t offsets = g_scan_offsets;
 
