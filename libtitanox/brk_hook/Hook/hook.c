@@ -11,6 +11,7 @@
 #include <string.h>
 #include <unistd.h>
 #include <errno.h>
+#include <time.h>
 #include <sys/mman.h>
 #include <libkern/OSCacheControl.h>
 
@@ -22,7 +23,10 @@
 #define HOOK_PATCH_SIZE 16
 #define HOOK_TRAMP_SIZE 256
 #define HOOK_TRAMP_NEED 48
-#define HOOK_LOG_LIMIT (1024L * 1024L)
+#define HOOK_LOG_LIMIT (4L * 1024L * 1024L)
+#define HOOK_LOG_ROLL 1
+#define HOOK_SCAN_DRY_LOGS 8
+#define HOOK_SCAN_DETAIL_LOGS 32
 #define HOOK_NEAR_RANGE (900LL * 1024LL)
 #define HOOK_BRANCH_RANGE (120LL * 1024LL * 1024LL)
 #define HOOK_VA_LIMIT 0x0000FFFFFFFFFFFFULL
@@ -52,6 +56,14 @@ static pthread_mutex_t g_log_lock = PTHREAD_MUTEX_INITIALIZER;
 
 static FILE *g_log = NULL;
 static long g_log_bytes = 0;
+static int g_scan_dry_logged = 0;
+static int g_scan_detail_logs = 0;
+static const char *g_scan_dry_label = NULL;
+static uint64_t g_log_rolls = 0;
+static uint64_t g_log_dropped = 0;
+static uint64_t g_slot_verify_fails = 0;
+static uint64_t g_slot_truncated = 0;
+static uint64_t g_ptr_target_cap_hits = 0;
 static uint64_t g_total_hits = 0;
 static uint64_t g_fail_count = 0;
 static kern_return_t g_last_kr = 0;
@@ -194,6 +206,34 @@ FILE *titanox_log_handle(void)
     return f;
 }
 
+static void hook_log_roll_locked(void)
+{
+    char stamp[64];
+    time_t now = time(NULL);
+    struct tm parts;
+
+    if (g_log) {
+        fclose(g_log);
+        g_log = NULL;
+    }
+
+    if (localtime_r(&now, &parts)) {
+        strftime(stamp, sizeof(stamp), "%Y-%m-%d %H:%M:%S", &parts);
+    } else {
+        snprintf(stamp, sizeof(stamp), "?");
+    }
+
+    g_log = open_log_locked();
+
+    if (!g_log) return;
+
+    g_log_bytes = 0;
+    g_log_rolls++;
+    g_log_bytes += fprintf(g_log, "[hook] === log rolled over #%llu at %s, earlier window dropped ===\n",
+                           (unsigned long long)g_log_rolls, stamp);
+    fflush(g_log);
+}
+
 void brk_diag_log(const char *format, ...)
 {
     char buffer[2048];
@@ -208,10 +248,23 @@ void brk_diag_log(const char *format, ...)
     FILE *f = open_log_locked();
     size_t size = strlen(buffer);
 
-    if (f && g_log_bytes + (long)size + 8 <= HOOK_LOG_LIMIT) {
+    if (f && g_log_bytes + (long)size + 8 > HOOK_LOG_LIMIT) {
+        if (HOOK_LOG_ROLL) {
+            hook_log_roll_locked();
+            f = g_log;
+        } else {
+            g_log_dropped++;
+            pthread_mutex_unlock(&g_log_lock);
+            return;
+        }
+    }
+
+    if (f) {
         int written = fprintf(f, "[hook] %s\n", buffer);
         if (written > 0) g_log_bytes += written;
         fflush(f);
+    } else {
+        g_log_dropped++;
     }
 
     pthread_mutex_unlock(&g_log_lock);
@@ -1118,20 +1171,8 @@ static void hook_build_patch(uintptr_t replacement, uint8_t *out)
     hook_put32(out, 12, (uint32_t)((replacement >> 32) & 0xFFFFFFFFu));
 }
 
-/* Both of these were too small, and the device said so plainly.
-
-   HOOK_PTR_SLOTS capped how many references to one target get rewritten. On the 19:03 run a
-   hook whose target is referenced by 443 slots reported `addr_hits=32 matches=443` and
-   `slots=32` -- so 411 of the 443 tables kept the original function and any object whose class
-   is among them could never reach the forwarder. That is indistinguishable, in the log, from
-   "the hook never fires", and it is the leading explanation for seven hooks reporting zero
-   calls across four runs in which a match was played.
-
-   The cost is 4 KB per entry instead of 256 bytes, and entries are static, so raising both is
-   simply 160 KB in the library image. */
 #define HOOK_PTR_ENTRIES 64
 #define HOOK_PTR_SLOTS 1024
-#define HOOK_PTR_BULK_MAX 32
 
 typedef struct {
     uintptr_t target;
@@ -1476,33 +1517,60 @@ static int hook_scan_tables_value(uintptr_t imageBase, uintptr_t needle, uintptr
 
                 g_scan_matches++;
 
-                if (hits >= capacity) continue;
+                if (hits >= capacity) {
+                    g_slot_truncated++;
+
+                    continue;
+                }
 
                 if (dryRun) {
                     slots[hits] = slot;
                     hits++;
 
-                    brk_diag_log("scan %s dry-run slot %p in %s holds %p mode=%d",
-                                 label ? label : "?",
-                                 (void *)slot,
-                                 seg->segname,
-                                 (void *)value,
-                                 mode);
+                    if (label && g_scan_dry_label != label) {
+                        g_scan_dry_label = label;
+                        g_scan_dry_logged = 0;
+                    }
+
+                    if (g_scan_dry_logged < HOOK_SCAN_DRY_LOGS) {
+                        g_scan_dry_logged++;
+
+                        brk_diag_log("scan %s dry-run slot %p in %s holds %p mode=%d",
+                                     label ? label : "?",
+                                     (void *)slot,
+                                     seg->segname,
+                                     (void *)value,
+                                     mode);
+                    }
 
                     continue;
                 }
 
                 uintptr_t writeValue = hook_slot_encode(replacement, &fix);
+                uintptr_t readBack = 0;
 
                 if (!hook_write_u64(slot, writeValue)) continue;
+
+                if (!hook_read_bytes(slot, &readBack, sizeof(readBack)) || readBack != writeValue) {
+                    g_slot_verify_fails++;
+
+                    hook_set_error("pointer slot %p did not take: wrote %p read %p",
+                                   (void *)slot, (void *)writeValue, (void *)readBack);
+
+                    continue;
+                }
 
                 slots[hits] = slot;
                 hits++;
                 g_scan_slots_used++;
 
-                brk_diag_log("pointer slot %p in %s referenced %p -> %p mode=%d",
-                             (void *)slot, seg->segname,
-                             (void *)needle, (void *)writeValue, mode);
+                if (g_scan_detail_logs < HOOK_SCAN_DETAIL_LOGS) {
+                    g_scan_detail_logs++;
+
+                    brk_diag_log("pointer slot %p in %s referenced %p -> %p mode=%d verified=yes",
+                                 (void *)slot, seg->segname,
+                                 (void *)needle, (void *)writeValue, mode);
+                }
             }
 
             p += want;
@@ -1518,30 +1586,9 @@ static int hook_scan_tables_value(uintptr_t imageBase, uintptr_t needle, uintptr
     return hits;
 }
 
-
-static bool hook_entry_looks_like_function(uintptr_t target)
-{
-    uint32_t w = 0;
-
-    if (!hook_read_bytes(target, &w, sizeof(w))) return false;
-
-    if ((w & 0xFFC003FFu) == 0xD10003FFu) return true;
-    if ((w & 0xFF4003E0u) == 0xA90003E0u) return true;
-    if ((w & 0xFF4003E0u) == 0xA80003E0u) return true;
-    if (w == 0xD503237Fu) return true;
-    if (w == 0xD503245Fu) return true;
-    if (w == 0xD65F03C0u) return true;
-    if (w == 0x910003FDu) return true;
-    if ((w & 0xFF000000u) == 0x14000000u) return true;
-    if ((w & 0x9F000000u) == 0x10000000u) return true;
-
-    return false;
-}
-
 static int hook_pointer_install(uintptr_t target, uintptr_t replacement)
 {
     hook_ptr_entry_t *entry = hook_pointer_find(target);
-    bool created = false;
 
     if (!entry) {
         for (int i = 0; i < HOOK_PTR_ENTRIES; i++) {
@@ -1550,7 +1597,6 @@ static int hook_pointer_install(uintptr_t target, uintptr_t replacement)
                 g_ptr_hooks[i].used = true;
                 g_ptr_hooks[i].target = target;
                 entry = &g_ptr_hooks[i];
-                created = true;
                 break;
             }
         }
@@ -1570,47 +1616,11 @@ static int hook_pointer_install(uintptr_t target, uintptr_t replacement)
 
     uintptr_t slots[HOOK_PTR_SLOTS];
 
-    int hits = hook_scan_tables_value(imageBase, target, 0, slots, HOOK_PTR_SLOTS, true, "probe");
-
-    if (hits > HOOK_PTR_BULK_MAX) {
-        uint32_t w = 0;
-
-        hook_read_bytes(target, &w, sizeof(w));
-        hook_set_error("pointer hook: reject-bulk target=%p slots=%d max=%d first=%08x",
-                       (void *)target, hits, HOOK_PTR_BULK_MAX, w);
-        brk_diag_log("pointer hook: reject-bulk target=%p hits=%d max=%d first=%08x wrote=0",
-                     (void *)target, hits, HOOK_PTR_BULK_MAX, w);
-
-        if (created) {
-            entry->used = false;
-            entry->target = 0;
-            entry->count = 0;
-        }
-
-        return 0;
-    }
-
-    if (!hook_entry_looks_like_function(target)) {
-        uint32_t w = 0;
-
-        hook_read_bytes(target, &w, sizeof(w));
-        hook_set_error("pointer hook: reject-nonfunc target=%p first=%08x", (void *)target, w);
-        brk_diag_log("pointer hook: reject-nonfunc target=%p first=%08x wrote=0", (void *)target, w);
-
-        if (created) {
-            entry->used = false;
-            entry->target = 0;
-            entry->count = 0;
-        }
-
-        return 0;
-    }
-
-    hits = hook_scan_tables_value(imageBase, target, replacement, slots, HOOK_PTR_SLOTS, false, "addr");
+    int hits = hook_scan_tables_value(imageBase, target, replacement, slots, HOOK_PTR_SLOTS, false, "addr");
 
     uint64_t offsets = g_scan_offsets;
 
-    brk_diag_log("pointer scan target=%p image=%p addr_hits=%d offset_only=%llu segments=%llu bytes=%llu values=%llu matches=%llu",
+    brk_diag_log("pointer scan target=%p image=%p addr_hits=%d offset_only=%llu segments=%llu bytes=%llu values=%llu matches=%llu truncated=%llu verifyFails=%llu",
                  (void *)target,
                  (void *)imageBase,
                  hits,
@@ -1618,7 +1628,9 @@ static int hook_pointer_install(uintptr_t target, uintptr_t replacement)
                  (unsigned long long)g_scan_segments,
                  (unsigned long long)g_scan_bytes,
                  (unsigned long long)g_scan_values,
-                 (unsigned long long)g_scan_matches);
+                 (unsigned long long)g_scan_matches,
+                 (unsigned long long)g_slot_truncated,
+                 (unsigned long long)g_slot_verify_fails);
 
     if (hits <= 0) {
         if (offsets > 0) {
@@ -2426,3 +2438,47 @@ bool unhook(void *oldArr[], int count)
 
     return ok;
 }
+
+void hook_report(void)
+{
+    int inlineUsed = 0;
+    int inlineArmed = 0;
+    int ptrUsed = 0;
+    int i = 0;
+
+    for (i = 0; i < HOOK_MAX; i++) {
+        if (g_hooks[i].used) inlineUsed++;
+        if (g_hooks[i].armed) inlineArmed++;
+    }
+
+    for (i = 0; i < HOOK_PTR_ENTRIES; i++) {
+        if (g_ptr_hooks[i].used) ptrUsed++;
+    }
+
+    brk_diag_log("REPORT caps inlineSlots=%d/%d ptrTargets=%d/%d ptrSlotsPerTarget=%d "
+                 "detailLines=%d dryRunLines=%d",
+                 inlineUsed, HOOK_MAX, ptrUsed, HOOK_PTR_ENTRIES, HOOK_PTR_SLOTS,
+                 HOOK_SCAN_DETAIL_LOGS, HOOK_SCAN_DRY_LOGS);
+
+    brk_diag_log("REPORT slots written=%llu verifyFails=%llu truncatedScans=%llu targetCapHits=%llu",
+                 (unsigned long long)g_ptr_writes, (unsigned long long)g_slot_verify_fails,
+                 (unsigned long long)g_slot_truncated, (unsigned long long)g_ptr_target_cap_hits);
+
+    brk_diag_log("REPORT scan segments=%llu bytes=%llu values=%llu matches=%llu unslidOffsets=%llu "
+                 "slotsUsed=%llu caveRuns=%llu caveRejected=%llu",
+                 (unsigned long long)g_scan_segments, (unsigned long long)g_scan_bytes,
+                 (unsigned long long)g_scan_values, (unsigned long long)g_scan_matches,
+                 (unsigned long long)g_scan_offsets, (unsigned long long)g_scan_slots_used,
+                 (unsigned long long)g_cave_runs, (unsigned long long)g_cave_rejected);
+
+    brk_diag_log("REPORT hooks installs=%llu totalHits=%llu failures=%llu inlineArmed=%d "
+                 "lastKernReturn=%d execRestoreBroken=%d ready=%d",
+                 (unsigned long long)g_install_count, (unsigned long long)g_total_hits,
+                 (unsigned long long)g_fail_count, inlineArmed, (int)g_last_kr,
+                 g_exec_restore_broken ? 1 : 0, g_ready ? 1 : 0);
+
+    brk_diag_log("REPORT log bytes=%ld/%ld rolls=%llu dropped=%llu lastError=%s",
+                 g_log_bytes, HOOK_LOG_LIMIT, (unsigned long long)g_log_rolls,
+                 (unsigned long long)g_log_dropped, hook_last_error());
+}
+
