@@ -70,6 +70,8 @@ void *brk_selftest_addr(void);
 
 void hook_selftest_probe(void);
 
+void hook_report(void);
+
 void brk_log_state(void);
 
 int brk_census(uint64_t *outHits, uint64_t *outFails, int *outLive);
@@ -97,3 +99,4 @@ bool unhook(void *oldArr[], int count);
 #endif
 
 #endif
+
