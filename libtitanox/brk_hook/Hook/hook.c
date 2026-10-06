@@ -181,9 +181,9 @@ static FILE *open_log_locked(void)
     char path[1024];
 
     if (home) {
-        snprintf(path, sizeof(path), "%s/Documents/Titanox.log", home);
+        snprintf(path, sizeof(path), "%s/Documents/Titanox_logs.txt", home);
     } else {
-        snprintf(path, sizeof(path), "/tmp/Titanox.log");
+        snprintf(path, sizeof(path), "/tmp/Titanox_logs.txt");
     }
 
     g_log = fopen(path, "a");
@@ -2481,4 +2481,3 @@ void hook_report(void)
                  g_log_bytes, HOOK_LOG_LIMIT, (unsigned long long)g_log_rolls,
                  (unsigned long long)g_log_dropped, hook_last_error());
 }
-
