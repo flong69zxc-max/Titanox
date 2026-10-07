@@ -179,7 +179,7 @@ static hook_ptr_entry_t g_ptr_hooks[HOOK_PTR_ENTRIES];
 
 static hook_ptr_entry_t *hook_pointer_find(uintptr_t target);
 
-static uintptr_t hook_image_base_for(uintptr_t address)
+uintptr_t rcl_hook_image_base(uintptr_t address)
 {
     uint32_t count = _dyld_image_count();
     if (count > 8192) count = 8192;
@@ -248,13 +248,98 @@ static uintptr_t hook_image_base_for(uintptr_t address)
     return 0;
 }
 
-static bool hook_write_u64(uintptr_t address, uintptr_t value)
+static uintptr_t g_reg_start = 0;
+static uintptr_t g_reg_end = 0;
+static vm_prot_t g_reg_prot = 0;
+static vm_prot_t g_reg_maxprot = 0;
+static bool g_reg_valid = false;
+
+static uintptr_t g_win_page = 0;
+static vm_prot_t g_win_saved = 0;
+static bool g_win_open = false;
+
+static bool hook_region_cached(uintptr_t address, vm_prot_t *prot, uintptr_t *start, uintptr_t *end, vm_prot_t *maxprot)
 {
+    if (g_reg_valid && address >= g_reg_start && address < g_reg_end) {
+        if (prot) *prot = g_reg_prot;
+        if (start) *start = g_reg_start;
+        if (end) *end = g_reg_end;
+        if (maxprot) *maxprot = g_reg_maxprot;
+        return true;
+    }
+
+    vm_prot_t p = 0;
+    uintptr_t s = 0;
+    uintptr_t e = 0;
+
+    if (!hook_region_info(address, &p, &s, &e)) {
+        g_reg_valid = false;
+        return false;
+    }
+
+    vm_prot_t maxProt = p;
+
+    hook_region_maxprot(address, &maxProt);
+
+    g_reg_start = s;
+    g_reg_end = e;
+    g_reg_prot = p;
+    g_reg_maxprot = maxProt;
+    g_reg_valid = true;
+
+    if (prot) *prot = p;
+    if (start) *start = s;
+    if (end) *end = e;
+    if (maxprot) *maxprot = maxProt;
+
+    return true;
+}
+
+static void hook_write_window_close(void)
+{
+    if (!g_win_open) return;
+
+    hook_page_set(g_win_page, 8, g_win_saved, false, NULL);
+
+    g_reg_prot = g_win_saved;
+    g_win_open = false;
+}
+
+static bool hook_write_window_open(uintptr_t address)
+{
+    if (g_win_open && (address & ~(uintptr_t)0xFFF) == g_win_page) return true;
+    if (g_win_open) hook_write_window_close();
+
     vm_prot_t prot = 0;
+    vm_prot_t maxProt = 0;
     uintptr_t start = 0;
     uintptr_t end = 0;
 
-    if (!hook_region_info(address, &prot, &start, &end)) return false;
+    if (!hook_region_cached(address, &prot, &start, &end, &maxProt)) return false;
+    if ((address + 8) > end) return false;
+
+    if ((prot & VM_PROT_WRITE) == 0) {
+        if ((maxProt & VM_PROT_WRITE) == 0) return false;
+        if (!hook_page_set(address, 8, (vm_prot_t)(maxProt | VM_PROT_READ | VM_PROT_WRITE), true, NULL)) return false;
+        if (!hook_page_set(address, 8, (vm_prot_t)(prot | VM_PROT_READ | VM_PROT_WRITE), false, NULL)) return false;
+        g_reg_prot = (vm_prot_t)(prot | VM_PROT_READ | VM_PROT_WRITE);
+    }
+
+    g_win_page = address & ~(uintptr_t)0xFFF;
+    g_win_saved = prot;
+    g_win_open = true;
+
+    return true;
+}
+
+static bool hook_write_u64(uintptr_t address, uintptr_t value)
+{
+    vm_prot_t prot = 0;
+    vm_prot_t maxProt = 0;
+    uintptr_t start = 0;
+    uintptr_t end = 0;
+
+    if (!hook_region_cached(address, &prot, &start, &end, &maxProt)) return false;
     if ((address + 8) > end) return false;
 
     if (prot & VM_PROT_EXECUTE) {
@@ -262,37 +347,19 @@ static bool hook_write_u64(uintptr_t address, uintptr_t value)
         return false;
     }
 
-    bool restore = false;
-    vm_prot_t savedProt = prot;
-
     if ((prot & VM_PROT_WRITE) == 0) {
-        vm_prot_t maxProt = 0;
-
-        if (!hook_region_maxprot(address, &maxProt)) return false;
-
         if ((maxProt & VM_PROT_WRITE) == 0) {
             hook_set_error("data write: maxprot at %p has no WRITE", (void *)address);
             return false;
         }
 
-        if (!hook_page_set(address, 8, (vm_prot_t)(maxProt | VM_PROT_READ | VM_PROT_WRITE), TRUE, NULL)) {
-            hook_set_error("data write: cannot raise maxprot at %p", (void *)address);
-            return false;
-        }
-
-        if (!hook_page_set(address, 8, (vm_prot_t)(prot | VM_PROT_READ | VM_PROT_WRITE), FALSE, NULL)) {
+        if (!hook_write_window_open(address)) {
             hook_set_error("data write: page %p stays read-only", (void *)address);
             return false;
         }
-
-        restore = true;
     }
 
     memcpy((void *)address, &value, 8);
-
-    if (restore) {
-        hook_page_set(address, 8, savedProt, FALSE, NULL);
-    }
 
     uintptr_t check = 0;
 
@@ -542,7 +609,7 @@ static int hook_pointer_install(uintptr_t target, uintptr_t replacement)
         return 0;
     }
 
-    uintptr_t imageBase = hook_image_base_for(target);
+    uintptr_t imageBase = rcl_hook_image_base(target);
 
     if (!imageBase) {
         hook_set_error("pointer hook: no image owns %p", (void *)target);
@@ -586,11 +653,11 @@ static hook_ptr_entry_t *hook_pointer_find(uintptr_t target)
     return NULL;
 }
 
-int hook_probe(uintptr_t target)
+static int hook_probe(uintptr_t target)
 {
     if (!target) return -1;
 
-    uintptr_t imageBase = hook_image_base_for(target);
+    uintptr_t imageBase = rcl_hook_image_base(target);
 
     if (!imageBase) return -1;
 
@@ -603,7 +670,7 @@ int hook_probe(uintptr_t target)
 }
 
 
-bool brk_install(void *target, void *replacement)
+static bool brk_install(void *target, void *replacement)
 {
     if (!target || !replacement) {
         hook_set_error("install: null argument target=%p replacement=%p", target, replacement);
@@ -616,7 +683,7 @@ bool brk_install(void *target, void *replacement)
     return hook_pointer_install(addr, repl) > 0;
 }
 
-bool brk_remove(void *target)
+static bool brk_remove(void *target)
 {
     if (!target) return false;
 
@@ -633,10 +700,12 @@ bool brk_remove(void *target)
 
     memset(ptrEntry, 0, sizeof(hook_ptr_entry_t));
 
+    hook_write_window_close();
+
     return restored;
 }
 
-void *brk_original_ptr(void *target)
+static void *brk_original_ptr(void *target)
 {
     if (!target) return NULL;
 
@@ -645,4 +714,67 @@ void *brk_original_ptr(void *target)
     return (void *)addr;
 }
 
+static bool hook_prologue_ok(uintptr_t address)
+{
+    uint32_t word = 0;
 
+    if (!hook_read_bytes(address, &word, sizeof(word))) return false;
+
+    if ((word & 0xFFC003FFu) == 0xD10003FFu) return true;
+    if ((word & 0xFF4003E0u) == 0xA90003E0u) return true;
+    if ((word & 0xFF4003E0u) == 0xA80003E0u) return true;
+    if (word == 0xD503237Fu) return true;
+    if (word == 0xD503245Fu) return true;
+    if (word == 0xD65F03C0u) return true;
+    if (word == 0x910003FDu) return true;
+    if ((word & 0xFF000000u) == 0x14000000u) return true;
+    if ((word & 0x9F000000u) == 0x10000000u) return true;
+
+    return false;
+}
+
+int rcl_hooks_install(uintptr_t imageBase, const rcl_hook_t *hooks, int count, void **originals)
+{
+    int installed = 0;
+
+    if (!imageBase || !hooks || count <= 0) return 0;
+
+    for (int i = 0; i < count; i++) {
+        uintptr_t target = 0;
+        int slots = 0;
+
+        if (originals) originals[i] = NULL;
+
+        if (!hooks[i].rva || !hooks[i].replacement) continue;
+
+        target = imageBase + hooks[i].rva;
+
+        slots = hook_probe(target);
+
+        if (slots <= 0 || slots > RCL_HOOK_SLOTS_MAX) continue;
+        if (!hook_prologue_ok(target)) continue;
+        if (!brk_install((void *)target, hooks[i].replacement)) continue;
+
+        if (originals) originals[i] = brk_original_ptr((void *)target);
+
+        installed++;
+    }
+
+    hook_write_window_close();
+
+    return installed;
+}
+
+int rcl_hooks_uninstall(void)
+{
+    int removed = 0;
+
+    for (int i = 0; i < HOOK_PTR_ENTRIES; i++) {
+        if (!g_ptr_hooks[i].used) continue;
+        if (brk_remove((void *)g_ptr_hooks[i].target)) removed++;
+    }
+
+    hook_write_window_close();
+
+    return removed;
+}
