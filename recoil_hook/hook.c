@@ -254,7 +254,8 @@ static vm_prot_t g_reg_prot = 0;
 static vm_prot_t g_reg_maxprot = 0;
 static bool g_reg_valid = false;
 
-static uintptr_t g_win_page = 0;
+static uintptr_t g_win_start = 0;
+static uintptr_t g_win_end = 0;
 static vm_prot_t g_win_saved = 0;
 static bool g_win_open = false;
 
@@ -299,15 +300,16 @@ static void hook_write_window_close(void)
 {
     if (!g_win_open) return;
 
-    hook_page_set(g_win_page, 8, g_win_saved, false, NULL);
+    hook_page_set(g_win_start, g_win_end - g_win_start, g_win_saved, false, NULL);
 
-    g_reg_prot = g_win_saved;
+    g_win_start = 0;
+    g_win_end = 0;
     g_win_open = false;
 }
 
 static bool hook_write_window_open(uintptr_t address)
 {
-    if (g_win_open && (address & ~(uintptr_t)0xFFF) == g_win_page) return true;
+    if (g_win_open && address >= g_win_start && address < g_win_end) return true;
     if (g_win_open) hook_write_window_close();
 
     vm_prot_t prot = 0;
@@ -317,15 +319,16 @@ static bool hook_write_window_open(uintptr_t address)
 
     if (!hook_region_cached(address, &prot, &start, &end, &maxProt)) return false;
     if ((address + 8) > end) return false;
+    if (prot & VM_PROT_EXECUTE) return false;
+    if ((prot & VM_PROT_WRITE) == 0 && (maxProt & VM_PROT_WRITE) == 0) return false;
 
     if ((prot & VM_PROT_WRITE) == 0) {
-        if ((maxProt & VM_PROT_WRITE) == 0) return false;
-        if (!hook_page_set(address, 8, (vm_prot_t)(maxProt | VM_PROT_READ | VM_PROT_WRITE), true, NULL)) return false;
-        if (!hook_page_set(address, 8, (vm_prot_t)(prot | VM_PROT_READ | VM_PROT_WRITE), false, NULL)) return false;
-        g_reg_prot = (vm_prot_t)(prot | VM_PROT_READ | VM_PROT_WRITE);
+        if (!hook_page_set(start, end - start, (vm_prot_t)(maxProt | VM_PROT_READ | VM_PROT_WRITE), true, NULL)) return false;
+        if (!hook_page_set(start, end - start, (vm_prot_t)(prot | VM_PROT_READ | VM_PROT_WRITE), false, NULL)) return false;
     }
 
-    g_win_page = address & ~(uintptr_t)0xFFF;
+    g_win_start = start;
+    g_win_end = end;
     g_win_saved = prot;
     g_win_open = true;
 
@@ -347,15 +350,17 @@ static bool hook_write_u64(uintptr_t address, uintptr_t value)
         return false;
     }
 
-    if ((prot & VM_PROT_WRITE) == 0) {
-        if ((maxProt & VM_PROT_WRITE) == 0) {
-            hook_set_error("data write: maxprot at %p has no WRITE", (void *)address);
-            return false;
-        }
+    if (!g_win_open || address < g_win_start || address >= g_win_end) {
+        if ((prot & VM_PROT_WRITE) == 0) {
+            if ((maxProt & VM_PROT_WRITE) == 0) {
+                hook_set_error("data write: maxprot at %p has no WRITE", (void *)address);
+                return false;
+            }
 
-        if (!hook_write_window_open(address)) {
-            hook_set_error("data write: page %p stays read-only", (void *)address);
-            return false;
+            if (!hook_write_window_open(address)) {
+                hook_set_error("data write: page %p stays read-only", (void *)address);
+                return false;
+            }
         }
     }
 
