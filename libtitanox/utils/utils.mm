@@ -94,13 +94,4 @@ NSString *THAppVersion() {
 }
 
 void THLog(NSString *format, ...) {
-    va_list args;
-    va_start(args, format);
-    NSString *msg = [[NSString alloc] initWithFormat:format arguments:args];
-    va_end(args);
-
-    NSString *entry = [NSString stringWithFormat:@"[%@] [Thread: %@] %@", THGetTimestamp(), THGetThreadID(), msg];
-
-    NSLog(@"%@", entry);
-    THWriteToFile([entry stringByAppendingString:@"\n"], THGetLogFileURL());
 }

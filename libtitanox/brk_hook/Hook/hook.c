@@ -175,27 +175,7 @@ bool hook_sign_check(uintptr_t address)
 
 static FILE *open_log_locked(void)
 {
-    if (g_log) return g_log;
-
-    const char *home = getenv("HOME");
-    char path[1024];
-
-    if (home) {
-        snprintf(path, sizeof(path), "%s/Documents/Titanox_logs.txt", home);
-    } else {
-        snprintf(path, sizeof(path), "/tmp/Titanox_logs.txt");
-    }
-
-    g_log = fopen(path, "a");
-
-    if (g_log) {
-        if (fseek(g_log, 0, SEEK_END) == 0) {
-            long position = ftell(g_log);
-            if (position >= 0) g_log_bytes = position;
-        }
-    }
-
-    return g_log;
+    return NULL;
 }
 
 FILE *titanox_log_handle(void)
