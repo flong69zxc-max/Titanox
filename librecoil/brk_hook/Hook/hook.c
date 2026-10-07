@@ -1014,7 +1014,7 @@ static hook_ptr_entry_t *hook_pointer_find(uintptr_t target);
 
 bool hook_code_patch_allowed(void)
 {
-    const char *flag = getenv("TITANOX_ALLOW_CODE_PATCH");
+    const char *flag = getenv("RECOIL_ALLOW_CODE_PATCH");
 
     if (g_exec_restore_broken) return false;
     if (flag && flag[0] == '0') return false;

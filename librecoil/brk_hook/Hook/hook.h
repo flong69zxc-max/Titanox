@@ -1,5 +1,5 @@
-#ifndef TITANOX_HOOK_H
-#define TITANOX_HOOK_H
+#ifndef RECOIL_HOOK_H
+#define RECOIL_HOOK_H
 
 #include <stdbool.h>
 #include <stdint.h>
