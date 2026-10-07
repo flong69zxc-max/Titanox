@@ -31,8 +31,4 @@ public:
     static void resumeSelf(void) {
         brk_resume_self();
     }
-
-    static bool selfTest(void) {
-        return brk_selftest();
-    }
 };

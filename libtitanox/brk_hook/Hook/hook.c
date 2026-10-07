@@ -23,8 +23,6 @@
 #define HOOK_PATCH_SIZE 16
 #define HOOK_TRAMP_SIZE 256
 #define HOOK_TRAMP_NEED 48
-#define HOOK_LOG_LIMIT (4L * 1024L * 1024L)
-#define HOOK_LOG_ROLL 1
 #define HOOK_SCAN_DRY_LOGS 8
 #define HOOK_SCAN_DETAIL_LOGS 32
 #define HOOK_NEAR_RANGE (900LL * 1024LL)
@@ -52,15 +50,10 @@ typedef struct {
 
 static hook_entry_t g_hooks[HOOK_MAX];
 static pthread_mutex_t g_lock = PTHREAD_MUTEX_INITIALIZER;
-static pthread_mutex_t g_log_lock = PTHREAD_MUTEX_INITIALIZER;
 
-static FILE *g_log = NULL;
-static long g_log_bytes = 0;
 static int g_scan_dry_logged = 0;
 static int g_scan_detail_logs = 0;
 static const char *g_scan_dry_label = NULL;
-static uint64_t g_log_rolls = 0;
-static uint64_t g_log_dropped = 0;
 static uint64_t g_slot_verify_fails = 0;
 static uint64_t g_slot_truncated = 0;
 static uint64_t g_ptr_target_cap_hits = 0;
@@ -173,90 +166,12 @@ bool hook_sign_check(uintptr_t address)
     return (prot & VM_PROT_EXECUTE) ? true : false;
 }
 
-static FILE *open_log_locked(void)
-{
-    return NULL;
-}
-
-FILE *titanox_log_handle(void)
-{
-    pthread_mutex_lock(&g_log_lock);
-    FILE *f = open_log_locked();
-    pthread_mutex_unlock(&g_log_lock);
-    return f;
-}
-
-static void hook_log_roll_locked(void)
-{
-    char stamp[64];
-    time_t now = time(NULL);
-    struct tm parts;
-
-    if (g_log) {
-        fclose(g_log);
-        g_log = NULL;
-    }
-
-    if (localtime_r(&now, &parts)) {
-        strftime(stamp, sizeof(stamp), "%Y-%m-%d %H:%M:%S", &parts);
-    } else {
-        snprintf(stamp, sizeof(stamp), "?");
-    }
-
-    g_log = open_log_locked();
-
-    if (!g_log) return;
-
-    g_log_bytes = 0;
-    g_log_rolls++;
-    g_log_bytes += fprintf(g_log, "[hook] === log rolled over #%llu at %s, earlier window dropped ===\n",
-                           (unsigned long long)g_log_rolls, stamp);
-    fflush(g_log);
-}
-
-void brk_diag_log(const char *format, ...)
-{
-    char buffer[2048];
-    va_list args;
-
-    va_start(args, format);
-    vsnprintf(buffer, sizeof(buffer), format, args);
-    va_end(args);
-
-    pthread_mutex_lock(&g_log_lock);
-
-    FILE *f = open_log_locked();
-    size_t size = strlen(buffer);
-
-    if (f && g_log_bytes + (long)size + 8 > HOOK_LOG_LIMIT) {
-        if (HOOK_LOG_ROLL) {
-            hook_log_roll_locked();
-            f = g_log;
-        } else {
-            g_log_dropped++;
-            pthread_mutex_unlock(&g_log_lock);
-            return;
-        }
-    }
-
-    if (f) {
-        int written = fprintf(f, "[hook] %s\n", buffer);
-        if (written > 0) g_log_bytes += written;
-        fflush(f);
-    } else {
-        g_log_dropped++;
-    }
-
-    pthread_mutex_unlock(&g_log_lock);
-}
-
 void hook_set_error(const char *format, ...)
 {
     va_list args;
     va_start(args, format);
     vsnprintf(g_last_error, sizeof(g_last_error), format, args);
     va_end(args);
-    brk_diag_log("%s", g_last_error);
 }
 
 const char *hook_last_error(void)
@@ -328,7 +243,6 @@ bool hook_verify_encryption(void *image)
     bool found = hook_image_encryption_state((const struct mach_header_64 *)image, &cryptid);
 
     if (!found) {
-        brk_diag_log("encryption check: LC_ENCRYPTION_INFO_64 absent, cryptid treated as 0");
         return true;
     }
 
@@ -337,7 +251,6 @@ bool hook_verify_encryption(void *image)
         abort();
     }
 
-    brk_diag_log("encryption check: cryptid=0");
     return true;
 }
 
@@ -412,14 +325,6 @@ static bool hook_page_writable(uintptr_t address, size_t length, vm_prot_t *save
 
     if (prot & VM_PROT_WRITE) return true;
 
-    brk_diag_log("write: %p cur=%c%c%c max=%c%c%c",
-                 (void *)address,
-                 (prot & VM_PROT_READ) ? 'r' : '-',
-                 (prot & VM_PROT_WRITE) ? 'w' : '-',
-                 (prot & VM_PROT_EXECUTE) ? 'x' : '-',
-                 (maxProt & VM_PROT_READ) ? 'r' : '-',
-                 (maxProt & VM_PROT_WRITE) ? 'w' : '-',
-                 (maxProt & VM_PROT_EXECUTE) ? 'x' : '-');
 
     if ((maxProt & (VM_PROT_READ | VM_PROT_WRITE)) != (VM_PROT_READ | VM_PROT_WRITE) ||
         (maxProt & VM_PROT_EXECUTE) != (prot & VM_PROT_EXECUTE)) {
@@ -432,11 +337,6 @@ static bool hook_page_writable(uintptr_t address, size_t length, vm_prot_t *save
             return false;
         }
 
-        brk_diag_log("write: maxprot raised to %c%c%c at %p",
-                     (raised & VM_PROT_READ) ? 'r' : '-',
-                     (raised & VM_PROT_WRITE) ? 'w' : '-',
-                     (raised & VM_PROT_EXECUTE) ? 'x' : '-',
-                     (void *)address);
     }
 
     uintptr_t pageStart = address & ~(uintptr_t)0xFFF;
@@ -455,7 +355,6 @@ static bool hook_page_writable(uintptr_t address, size_t length, vm_prot_t *save
 
     if (kr == KERN_SUCCESS) return true;
 
-    brk_diag_log("page rw+copy failed kr=%d errno=%d, retrying rw only", kr, errno);
 
     kr = vm_protect(
         mach_task_self(),
@@ -480,32 +379,22 @@ static bool hook_page_restore(uintptr_t address, size_t length, vm_prot_t saved)
 
     if (hook_page_set(address, length, target, FALSE, NULL)) return true;
 
-    brk_diag_log("restore: plain r-x failed kr=%d at %p", (int)g_last_kr, (void *)address);
 
     if (hook_page_set(address, length, (vm_prot_t)(target | VM_PROT_COPY), FALSE, NULL)) {
-        brk_diag_log("restore: COPY|r-x ok at %p", (void *)address);
         return true;
     }
 
-    brk_diag_log("restore: COPY|r-x failed kr=%d at %p", (int)g_last_kr, (void *)address);
 
     hook_region_maxprot(address, &maxProt);
 
-    brk_diag_log("restore: maxprot at %p = %c%c%c",
-                 (void *)address,
-                 (maxProt & VM_PROT_READ) ? 'r' : '-',
-                 (maxProt & VM_PROT_WRITE) ? 'w' : '-',
-                 (maxProt & VM_PROT_EXECUTE) ? 'x' : '-');
 
     if (hook_page_set(address, length,
                       (vm_prot_t)(maxProt | VM_PROT_READ | VM_PROT_WRITE | VM_PROT_EXECUTE),
                       TRUE, NULL) &&
         hook_page_set(address, length, target, FALSE, NULL)) {
-        brk_diag_log("restore: maxprot rwx then r-x ok at %p", (void *)address);
         return true;
     }
 
-    brk_diag_log("restore: maxprot rwx path failed kr=%d at %p", (int)g_last_kr, (void *)address);
 
     hook_set_error("restore: failed at %p kr=%d", (void *)address, (int)g_last_kr);
 
@@ -522,35 +411,6 @@ static bool hook_page_executable(uintptr_t address, size_t length)
     if ((address + length) > end) return false;
 
     return (prot & VM_PROT_EXECUTE) ? true : false;
-}
-
-void hook_log_prot(const char *label, uintptr_t address)
-{
-    vm_prot_t prot = 0;
-    uintptr_t start = 0;
-    uintptr_t end = 0;
-
-    if (!hook_region_info(address, &prot, &start, &end)) {
-        brk_diag_log("%s %p prot=unmapped", label ? label : "prot", (void *)address);
-        return;
-    }
-
-    vm_prot_t maxProt = 0;
-
-    if (!hook_region_maxprot(address, &maxProt)) maxProt = 0;
-
-    brk_diag_log("%s %p-%p cur=%c%c%c max=%c%c%c writable=%d executable=%d",
-                 label ? label : "prot",
-                 (void *)start,
-                 (void *)end,
-                 (prot & VM_PROT_READ) ? 'r' : '-',
-                 (prot & VM_PROT_WRITE) ? 'w' : '-',
-                 (prot & VM_PROT_EXECUTE) ? 'x' : '-',
-                 (maxProt & VM_PROT_READ) ? 'r' : '-',
-                 (maxProt & VM_PROT_WRITE) ? 'w' : '-',
-                 (maxProt & VM_PROT_EXECUTE) ? 'x' : '-',
-                 (maxProt & VM_PROT_WRITE) ? 1 : 0,
-                 (maxProt & VM_PROT_EXECUTE) ? 1 : 0);
 }
 
 static bool hook_make_executable(uintptr_t address, size_t length)
@@ -599,7 +459,6 @@ static bool hook_make_executable(uintptr_t address, size_t length)
     }
 
     if (after & VM_PROT_WRITE) {
-        brk_diag_log("exec: %p is still writable after RX transition (prot=%d)", (void *)start, (int)after);
     }
 
     return true;
@@ -1034,8 +893,6 @@ static uintptr_t hook_alloc_from_cave(uintptr_t target, size_t size, bool *near)
     if (!hook_region_maxprot(target, &maxProt)) return 0;
 
     if ((maxProt & VM_PROT_WRITE) == 0) {
-        brk_diag_log("trampoline: region %p-%p maxprot has no WRITE, cave unusable",
-                     (void *)regionStart, (void *)regionEnd);
         return 0;
     }
 
@@ -1057,12 +914,6 @@ static uintptr_t hook_alloc_from_cave(uintptr_t target, size_t size, bool *near)
         if (!g_cave_logged) {
             g_cave_logged = true;
 
-            brk_diag_log("cave scan %p-%p need=%llu runs=%llu rejected=%llu",
-                         (void *)regionStart,
-                         (void *)regionEnd,
-                         (unsigned long long)HOOK_TRAMP_NEED,
-                         (unsigned long long)g_cave_runs,
-                         (unsigned long long)g_cave_rejected);
         }
 
         return 0;
@@ -1072,8 +923,6 @@ static uintptr_t hook_alloc_from_cave(uintptr_t target, size_t size, bool *near)
 
     if (near) *near = true;
 
-    brk_diag_log("trampoline cave target=%p cave=%p region=%p-%p",
-                 (void *)target, (void *)cave, (void *)regionStart, (void *)regionEnd);
 
     return cave;
 }
@@ -1090,7 +939,6 @@ static uintptr_t hook_alloc_trampoline(uintptr_t target, size_t size, bool *near
         return cave;
     }
 
-    brk_diag_log("trampoline: no code cave for %p, falling back to mmap", (void *)target);
 
     void *mapped = mmap(NULL, size, PROT_READ | PROT_WRITE,
                         MAP_PRIVATE | MAP_ANON, -1, 0);
@@ -1100,8 +948,6 @@ static uintptr_t hook_alloc_trampoline(uintptr_t target, size_t size, bool *near
         if (delta < 0) delta = -delta;
         if (near) *near = (delta <= HOOK_NEAR_RANGE);
 
-        brk_diag_log("trampoline mmap ptr=%p delta=%lld",
-                     mapped, (long long)((int64_t)(uintptr_t)mapped - (int64_t)target));
 
         return (uintptr_t)mapped;
     }
@@ -1116,7 +962,6 @@ static uintptr_t hook_alloc_trampoline(uintptr_t target, size_t size, bool *near
         return 0;
     }
 
-    brk_diag_log("trampoline retry mmap ptr=%p size=%zu", mapped, bigger);
     return (uintptr_t)mapped;
 }
 
@@ -1455,14 +1300,6 @@ static int hook_scan_tables_value(uintptr_t imageBase, uintptr_t needle, uintptr
         uintptr_t end = start + (uintptr_t)seg->vmsize;
 
         if (!g_seg_layout_logged && segments < 24) {
-            brk_diag_log("scan %s seg %s %p-%p size=%llu initprot=%d maxprot=%d",
-                         label ? label : "?",
-                         seg->segname,
-                         (void *)start,
-                         (void *)end,
-                         (unsigned long long)seg->vmsize,
-                         (int)seg->initprot,
-                         (int)seg->maxprot);
         }
 
         segments++;
@@ -1515,12 +1352,6 @@ static int hook_scan_tables_value(uintptr_t imageBase, uintptr_t needle, uintptr
                     if (g_scan_dry_logged < HOOK_SCAN_DRY_LOGS) {
                         g_scan_dry_logged++;
 
-                        brk_diag_log("scan %s dry-run slot %p in %s holds %p mode=%d",
-                                     label ? label : "?",
-                                     (void *)slot,
-                                     seg->segname,
-                                     (void *)value,
-                                     mode);
                     }
 
                     continue;
@@ -1547,9 +1378,6 @@ static int hook_scan_tables_value(uintptr_t imageBase, uintptr_t needle, uintptr
                 if (g_scan_detail_logs < HOOK_SCAN_DETAIL_LOGS) {
                     g_scan_detail_logs++;
 
-                    brk_diag_log("pointer slot %p in %s referenced %p -> %p mode=%d verified=yes",
-                                 (void *)slot, seg->segname,
-                                 (void *)needle, (void *)writeValue, mode);
                 }
             }
 
@@ -1600,17 +1428,6 @@ static int hook_pointer_install(uintptr_t target, uintptr_t replacement)
 
     uint64_t offsets = g_scan_offsets;
 
-    brk_diag_log("pointer scan target=%p image=%p addr_hits=%d offset_only=%llu segments=%llu bytes=%llu values=%llu matches=%llu truncated=%llu verifyFails=%llu",
-                 (void *)target,
-                 (void *)imageBase,
-                 hits,
-                 (unsigned long long)offsets,
-                 (unsigned long long)g_scan_segments,
-                 (unsigned long long)g_scan_bytes,
-                 (unsigned long long)g_scan_values,
-                 (unsigned long long)g_scan_matches,
-                 (unsigned long long)g_slot_truncated,
-                 (unsigned long long)g_slot_verify_fails);
 
     if (hits <= 0) {
         if (offsets > 0) {
@@ -1677,14 +1494,6 @@ int hook_probe(uintptr_t target)
 
     int hits = hook_scan_tables_value(imageBase, target, 0, slots, HOOK_PTR_SLOTS, true, "probe");
 
-    brk_diag_log("probe target=%p image=%p slots=%d offset_only=%llu segments=%llu bytes=%llu values=%llu",
-                 (void *)target,
-                 (void *)imageBase,
-                 hits,
-                 (unsigned long long)g_scan_offsets,
-                 (unsigned long long)g_scan_segments,
-                 (unsigned long long)g_scan_bytes,
-                 (unsigned long long)g_scan_values);
 
     return hits;
 }
@@ -1703,8 +1512,6 @@ bool brk_install(void *target, void *replacement)
 
     if (hook_code_patch_allowed() && hook_code_install(addr, repl)) return true;
 
-    brk_diag_log("install: inline patch unavailable at %p (%s), trying pointer slot",
-                 (void *)addr, hook_last_error());
 
     int hits = hook_pointer_install(addr, repl);
 
@@ -1712,8 +1519,6 @@ bool brk_install(void *target, void *replacement)
         g_install_count++;
         g_ready = true;
 
-        brk_diag_log("install target=%p replacement=%p mode=pointer slots=%d status=1",
-                     (void *)addr, (void *)repl, hits);
 
         return true;
     }
@@ -1789,8 +1594,6 @@ static bool hook_code_install(uintptr_t addr, uintptr_t repl)
         bool updated = hook_write_bytes(entry->target, entry->patch, HOOK_PATCH_SIZE);
         pthread_mutex_unlock(&g_lock);
 
-        brk_diag_log("install update target=%p replacement=%p status=%d",
-                     (void *)addr, (void *)repl, updated ? 1 : 0);
 
         return updated;
     }
@@ -1862,14 +1665,11 @@ static bool hook_code_install(uintptr_t addr, uintptr_t repl)
             return false;
         }
 
-        hook_log_prot("trampoline in cave", tramp);
     } else {
         memcpy((void *)tramp, trampoline, trampBytes);
 
-        hook_log_prot("trampoline before RX", tramp);
 
         if (!hook_make_executable(tramp, trampBytes)) {
-            hook_log_prot("trampoline after RX failed", tramp);
             vm_deallocate(mach_task_self(), (vm_address_t)tramp, (vm_size_t)HOOK_TRAMP_SIZE);
             entry->used = false;
             pthread_mutex_unlock(&g_lock);
@@ -1877,7 +1677,6 @@ static bool hook_code_install(uintptr_t addr, uintptr_t repl)
             return false;
         }
 
-        hook_log_prot("trampoline after RX", tramp);
     }
 
     uint8_t patch[HOOK_PATCH_SIZE];
@@ -1904,14 +1703,6 @@ static bool hook_code_install(uintptr_t addr, uintptr_t repl)
 
     pthread_mutex_unlock(&g_lock);
 
-    brk_diag_log("install target=%p replacement=%p tramp=%p block=%d near=%d cave=%d saved=%08x %08x %08x %08x status=1",
-                 (void *)addr,
-                 (void *)repl,
-                 (void *)tramp,
-                 blockSize,
-                 near ? 1 : 0,
-                 fromCave ? 1 : 0,
-                 original[0], original[1], original[2], original[3]);
 
     return true;
 }
@@ -1954,8 +1745,6 @@ bool brk_remove(void *target)
         int slotCount = ptrEntry->count;
         memset(ptrEntry, 0, sizeof(hook_ptr_entry_t));
 
-        brk_diag_log("remove target=%p mode=pointer slots=%d status=%d",
-                     (void *)addr, slotCount, restored ? 1 : 0);
 
         return restored;
     }
@@ -1979,7 +1768,6 @@ bool brk_remove(void *target)
 
     pthread_mutex_unlock(&g_lock);
 
-    brk_diag_log("remove target=%p status=%d", (void *)addr, restored ? 1 : 0);
     return restored;
 }
 
@@ -2092,169 +1880,11 @@ int brk_next_slot(int after)
     return result;
 }
 
-void hook_selftest_probe(void) {}
-
 static volatile int g_selftest_hits = 0;
 
 typedef int (*hook_selftest_fn)(int);
 
 static volatile hook_selftest_fn g_selftest_call = NULL;
-
-static int hook_selftest_replacement(int value)
-{
-    g_selftest_hits++;
-    return value + 1000;
-}
-
-bool brk_selftest_at(uintptr_t hint)
-{
-    g_selftest_hits = 0;
-
-    uint32_t code[3];
-    code[0] = 0x52800020u;
-    code[1] = 0x11000400u;
-    code[2] = 0xD65F03C0u;
-
-    bool mapped = false;
-    uintptr_t page = 0;
-
-    if (hint) page = hook_alloc_from_cave(hint, 64, NULL);
-
-    if (page) {
-        brk_diag_log("selftest: test function placed in cave %p (hint=%p)",
-                     (void *)page, (void *)hint);
-
-        if (!hook_write_bytes(page, code, sizeof(code))) {
-            hook_set_error("selftest: cannot write test function into cave %p", (void *)page);
-            return false;
-        }
-    } else {
-        void *raw = mmap(NULL, 0x4000, PROT_READ | PROT_WRITE,
-                         MAP_PRIVATE | MAP_ANON, -1, 0);
-
-        if (raw == MAP_FAILED) {
-            hook_set_error("selftest: mmap failed errno=%d", errno);
-            return false;
-        }
-
-        mapped = true;
-        page = (uintptr_t)raw;
-
-        memcpy((void *)page, code, sizeof(code));
-
-        if (!hook_make_executable(page, sizeof(code))) {
-            hook_set_error("selftest: generated code cannot be made executable");
-            munmap((void *)page, 0x4000);
-            return false;
-        }
-    }
-
-    hook_log_prot("selftest page", page);
-
-    g_selftest_call = (hook_selftest_fn)sign_fn(page);
-
-    int baseline = g_selftest_call(1);
-
-    if (baseline != 2) {
-        hook_set_error("selftest: baseline call returned %d", baseline);
-        if (mapped) munmap((void *)page, 0x4000);
-        g_selftest_call = NULL;
-        return false;
-    }
-
-    if (!brk_install((void *)page, (void *)hook_selftest_replacement)) {
-        if (mapped) munmap((void *)page, 0x4000);
-        g_selftest_call = NULL;
-        return false;
-    }
-
-    int intercepted = g_selftest_call(1);
-
-    hook_selftest_fn original = (hook_selftest_fn)brk_original_ptr((void *)page);
-    int viaOriginal = original ? original(1) : -1;
-
-    bool ok = (intercepted == 1001) && (g_selftest_hits == 1) && (viaOriginal == 2);
-
-    if (ok) {
-        brk_diag_log("selftest inline patch verified intercepted=%d via_original=%d hits=%d",
-                     intercepted, viaOriginal, g_selftest_hits);
-    } else {
-        hook_set_error("selftest: intercepted=%d hits=%d via_original=%d",
-                       intercepted, g_selftest_hits, viaOriginal);
-    }
-
-    brk_remove((void *)page);
-
-    if (mapped) munmap((void *)page, 0x4000);
-
-    g_selftest_call = NULL;
-
-    return ok;
-}
-
-bool brk_selftest(void)
-{
-    return brk_selftest_at(0);
-}
-
-void *brk_selftest_addr(void)
-{
-    return (void *)&hook_selftest_probe;
-}
-
-void brk_log_state(void)
-{
-    pthread_mutex_lock(&g_lock);
-
-    int live = 0;
-
-    for (int i = 0; i < HOOK_MAX; i++) {
-        if (g_hooks[i].used && g_hooks[i].armed) live++;
-    }
-
-    brk_diag_log("state slots=%d live=%d installed=%llu hits=%llu fails=%llu ptr_hooks=%d ptr_slots=%d code_patch=%d",
-                 HOOK_MAX,
-                 live,
-                 (unsigned long long)g_install_count,
-                 (unsigned long long)g_total_hits,
-                 (unsigned long long)g_fail_count,
-                 hook_pointer_count(),
-                 hook_pointer_slots(),
-                 hook_code_patch_allowed() ? 1 : 0);
-
-    for (int i = 0; i < HOOK_MAX; i++) {
-        if (!g_hooks[i].used) continue;
-
-        brk_diag_log("slot %d target=%p tramp=%p replacement=%p block=%u near=%d armed=%d hits=%llu",
-                     i,
-                     (void *)g_hooks[i].target,
-                     (void *)g_hooks[i].tramp,
-                     (void *)g_hooks[i].replacement,
-                     g_hooks[i].block_bytes,
-                     g_hooks[i].near ? 1 : 0,
-                     g_hooks[i].armed ? 1 : 0,
-                     (unsigned long long)g_hooks[i].hits);
-    }
-
-    pthread_mutex_unlock(&g_lock);
-}
-
-int brk_census(uint64_t *outHits, uint64_t *outFails, int *outLive)
-{
-    if (outHits) *outHits = g_total_hits;
-    if (outFails) *outFails = g_fail_count;
-    if (outLive) *outLive = brk_live_slot_count();
-
-    return brk_live_slot_count();
-}
-
-void brk_trace_exception(const char *label)
-{
-    brk_diag_log("trace label=%s live=%d hits=%llu",
-                 label ? label : "?",
-                 brk_live_slot_count(),
-                 (unsigned long long)g_total_hits);
-}
 
 static bool hook_name_marks_host_runtime(const char *name)
 {
@@ -2300,49 +1930,6 @@ bool brk_host_is_livecontainer(void)
     return false;
 }
 
-bool brk_chain_active(void)
-{
-    return false;
-}
-
-mach_port_t brk_previous_port(void)
-{
-    exception_mask_t masks[EXC_TYPES_COUNT];
-    mach_port_t ports[EXC_TYPES_COUNT];
-    exception_behavior_t behaviors[EXC_TYPES_COUNT];
-    thread_state_flavor_t flavors[EXC_TYPES_COUNT];
-    mach_msg_type_number_t count = EXC_TYPES_COUNT;
-
-    kern_return_t kr = task_get_exception_ports(
-        mach_task_self(),
-        EXC_MASK_BREAKPOINT,
-        masks,
-        &count,
-        ports,
-        behaviors,
-        flavors
-    );
-
-    if (kr != KERN_SUCCESS) return MACH_PORT_NULL;
-
-    mach_port_t observed = MACH_PORT_NULL;
-
-    for (mach_msg_type_number_t i = 0; i < count; ++i) {
-        if (ports[i] != MACH_PORT_NULL) {
-            if (observed == MACH_PORT_NULL) observed = ports[i];
-            mach_port_deallocate(mach_task_self(), ports[i]);
-        }
-    }
-
-    return observed;
-}
-
-uint64_t brk_chain_counters(uint64_t *fails)
-{
-    if (fails) *fails = g_fail_count;
-    return g_total_hits;
-}
-
 bool brk_arm_function_rva(uintptr_t imageBase, uintptr_t rva, void *replacement, void **outOriginal)
 {
     if (!imageBase || !rva || !replacement) return false;
@@ -2380,7 +1967,6 @@ void brk_teardown(void)
 
     pthread_mutex_unlock(&g_lock);
 
-    brk_diag_log("teardown complete");
 }
 
 bool hook(void *oldArr[], void *newArr[], int count)
@@ -2417,47 +2003,4 @@ bool unhook(void *oldArr[], int count)
     }
 
     return ok;
-}
-
-void hook_report(void)
-{
-    int inlineUsed = 0;
-    int inlineArmed = 0;
-    int ptrUsed = 0;
-    int i = 0;
-
-    for (i = 0; i < HOOK_MAX; i++) {
-        if (g_hooks[i].used) inlineUsed++;
-        if (g_hooks[i].armed) inlineArmed++;
-    }
-
-    for (i = 0; i < HOOK_PTR_ENTRIES; i++) {
-        if (g_ptr_hooks[i].used) ptrUsed++;
-    }
-
-    brk_diag_log("REPORT caps inlineSlots=%d/%d ptrTargets=%d/%d ptrSlotsPerTarget=%d "
-                 "detailLines=%d dryRunLines=%d",
-                 inlineUsed, HOOK_MAX, ptrUsed, HOOK_PTR_ENTRIES, HOOK_PTR_SLOTS,
-                 HOOK_SCAN_DETAIL_LOGS, HOOK_SCAN_DRY_LOGS);
-
-    brk_diag_log("REPORT slots written=%llu verifyFails=%llu truncatedScans=%llu targetCapHits=%llu",
-                 (unsigned long long)g_ptr_writes, (unsigned long long)g_slot_verify_fails,
-                 (unsigned long long)g_slot_truncated, (unsigned long long)g_ptr_target_cap_hits);
-
-    brk_diag_log("REPORT scan segments=%llu bytes=%llu values=%llu matches=%llu unslidOffsets=%llu "
-                 "slotsUsed=%llu caveRuns=%llu caveRejected=%llu",
-                 (unsigned long long)g_scan_segments, (unsigned long long)g_scan_bytes,
-                 (unsigned long long)g_scan_values, (unsigned long long)g_scan_matches,
-                 (unsigned long long)g_scan_offsets, (unsigned long long)g_scan_slots_used,
-                 (unsigned long long)g_cave_runs, (unsigned long long)g_cave_rejected);
-
-    brk_diag_log("REPORT hooks installs=%llu totalHits=%llu failures=%llu inlineArmed=%d "
-                 "lastKernReturn=%d execRestoreBroken=%d ready=%d",
-                 (unsigned long long)g_install_count, (unsigned long long)g_total_hits,
-                 (unsigned long long)g_fail_count, inlineArmed, (int)g_last_kr,
-                 g_exec_restore_broken ? 1 : 0, g_ready ? 1 : 0);
-
-    brk_diag_log("REPORT log bytes=%ld/%ld rolls=%llu dropped=%llu lastError=%s",
-                 g_log_bytes, HOOK_LOG_LIMIT, (unsigned long long)g_log_rolls,
-                 (unsigned long long)g_log_dropped, hook_last_error());
 }
